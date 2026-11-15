@@ -117,6 +117,8 @@ struct music_features_state {
 	uint16_t slow_raw_q8[MUSIC_FEATURES_BANDS];
 	uint8_t prev_raw[MUSIC_FEATURES_BANDS];
 	uint8_t onset_out[MUSIC_FEATURES_BAND_GROUPS];
+	/* Recent peak of each group's raw flux: the onset normalisation scale. */
+	uint16_t onset_peak[MUSIC_FEATURES_BAND_GROUPS];
 	uint8_t onset_hist[MUSIC_FEATURES_ONSET_HISTORY];
 	uint16_t hist_index;
 	uint16_t hist_filled;
@@ -263,7 +265,25 @@ static inline void music_features_state_init(struct music_features_state *state)
  * of snapping it, so period-quantised onset timing averages out. */
 #define MF_PHASE_CORRECT_SHIFT 1U
 #define MF_ONSET_DECAY 20U
-#define MF_GROUP_FLOOR 24
+/*
+ * Onset normalisation.  A group's flux is the summed rise of its four band
+ * levels (about 23 per 6 dB each).  On mastered music a kick moves that sum
+ * by 60..250 of a possible 1020, so the raw value never reached the published
+ * 0..255 range and nothing downstream saw a beat.  Each group is therefore
+ * scaled by its own recent peak: the peak jumps to a stronger hit and
+ * decays with a ~2.7 s time constant, and never drops below
+ * MF_ONSET_PEAK_FLOOR, so the residue of steady material is not blown up into
+ * hits.  The strongest recent hit publishes near 255, weaker ones in
+ * proportion.
+ */
+#define MF_ONSET_PEAK_FLOOR 72U
+/* Raw flux below this is level ripple (pads, noise), not an onset. */
+#define MF_ONSET_NOISE 24U
+#define MF_ONSET_PEAK_DECAY_SHIFT 6U
+/* A group onset counts as a hit from this normalised level. */
+#define MF_GROUP_FLOOR 80
+/* The broadband envelope counts as a beat from this normalised level. */
+#define MF_BEAT_FLOOR 56
 #define MF_GROUP_REFRACTORY 3U
 
 #define MF_QUIET_LEVEL 20
@@ -416,6 +436,7 @@ static inline void music_features_update(struct music_features_state *state,
 	int32_t best_score = -1;
 	uint16_t best_q8 = 0;
 	uint8_t onset_env;
+	uint8_t impact;
 	uint8_t fast255, slow255;
 	uint16_t events = 0;
 	uint16_t beat_bpm = 0;
@@ -500,41 +521,70 @@ static inline void music_features_update(struct music_features_state *state,
 		(low * 255U) / (low + mid + high + 1U) << 8, MF_WARMTH_SHIFT);
 
 	/*
-	 * Differentiated onsets: positive spectral flux per band group, held
-	 * with a short peak decay so a single period of attack is visible in
+	 * Differentiated onsets: positive spectral flux per band group,
+	 * normalised by the group's recent peak (see MF_ONSET_PEAK_FLOOR) and
+	 * released by half per update, so each hit is a clear rising edge in
 	 * the published frame.  Steady material converges to zero flux.
 	 */
 	{
 		int raw_group[3];
-		uint8_t out_group[3];
+		uint32_t fresh[3];
 
-		raw_group[0] = flux_low >> 2;	/* 4 bands, 255 each */
-		raw_group[1] = flux_mid >> 2;
-		raw_group[2] = flux_high >> 2;
+		uint32_t loudest = MF_ONSET_PEAK_FLOOR * 2U;
+
+		raw_group[0] = flux_low;	/* 4 bands, 255 each */
+		raw_group[1] = flux_mid;
+		raw_group[2] = flux_high;
 		for (g = 0; g < MUSIC_FEATURES_BAND_GROUPS; ++g) {
-			int value = raw_group[g];
+			uint32_t flux = (uint32_t)raw_group[g];
+			uint32_t peak = state->onset_peak[g];
 
-			if (value > 255)
-				value = 255;
-			if (value < (int)state->onset_out[g] &&
-			    state->onset_out[g] > MF_ONSET_DECAY)
-				value = state->onset_out[g] - MF_ONSET_DECAY;
-			else if (value < state->onset_out[g])
-				value = 0;
-			out_group[g] = (uint8_t)value;
-			state->onset_out[g] = out_group[g];
+			flux = flux > MF_ONSET_NOISE ? flux - MF_ONSET_NOISE : 0U;
+			raw_group[g] = (int)flux;
+			if (flux > peak)
+				peak = flux;
+			else
+				peak -= (peak >> MF_ONSET_PEAK_DECAY_SHIFT) +
+					(peak != 0);
+			state->onset_peak[g] = (uint16_t)peak;
+			if (peak > loudest)
+				loudest = peak;
+		}
+		for (g = 0; g < MUSIC_FEATURES_BAND_GROUPS; ++g) {
+			uint32_t flux = (uint32_t)raw_group[g];
+			/* Scale by the mean of the group's own peak and the
+			 * loudest group's, so the spill of a kick into the
+			 * mid bands stays smaller than the kick. */
+			uint32_t scale = (state->onset_peak[g] + loudest + 1U) /
+					 2U;
+			uint32_t value;
+			uint32_t held = state->onset_out[g] / 2U;
+
+			value = flux * 255U / scale;
+			if (value > 255U)
+				value = 255U;
+			fresh[g] = value;
+			if (value < held)
+				value = held;
+			state->onset_out[g] = (uint8_t)value;
 			state->group_mean_q8[g] = music_features_ema_q8(
 				state->group_mean_q8[g],
-				(uint32_t)out_group[g] << 8, MF_GROUP_MEAN_SHIFT);
+				value << 8, MF_GROUP_MEAN_SHIFT);
 		}
+		/* Broadband envelope for the tempo search: bass weighs double. */
+		onset_env = (uint8_t)((2U * fresh[0] + fresh[1] + fresh[2] + 2U) /
+				      4U);
 	}
-	onset_env = music_features_u8(
+	/* Absolute broadband impact (not normalised), for transientness and
+	 * the drop/fill gates, which must not open on a quiet passage's
+	 * strongest note. */
+	impact = music_features_u8(
 		(uint16_t)(((uint32_t)(flux_low + flux_mid + flux_high) >> 4)
 			   << 8));
 
 	/* Transientness: fast rise, slower fall. */
 	{
-		uint16_t target_q8 = (uint16_t)((uint8_t)onset_env << 8);
+		uint16_t target_q8 = (uint16_t)((uint8_t)impact << 8);
 
 		state->transient_q8 = music_features_ema_q8(
 			state->transient_q8, target_q8,
@@ -755,8 +805,8 @@ static inline void music_features_update(struct music_features_state *state,
 	{
 		int threshold = (int)(state->onset_mean_q8 >> 8) * 2;
 
-		if (threshold < MF_GROUP_FLOOR)
-			threshold = MF_GROUP_FLOOR;
+		if (threshold < MF_BEAT_FLOOR)
+			threshold = MF_BEAT_FLOOR;
 		if (state->beat_refractory == 0 &&
 		    state->confidence >= MF_BEAT_PHASE_LEVEL &&
 		    onset_env >= threshold) {
@@ -894,7 +944,7 @@ static inline void music_features_update(struct music_features_state *state,
 		if (fast255 >= MF_DROP_LEVEL &&
 		    ((state->dip_active &&
 		      (int)fast255 >= (int)state->dip_low + MF_DROP_RECOVER) ||
-		     onset_env >= MF_DROP_ONSET) &&
+		     impact >= MF_DROP_ONSET) &&
 		    mf_cooldown_ok(state, MUSIC_COOLDOWN_DROP)) {
 			events |= MUSIC_EVENT_DROP;
 			mf_cooldown_arm(state, MUSIC_COOLDOWN_DROP, MF_CD_DROP);
@@ -931,13 +981,13 @@ static inline void music_features_update(struct music_features_state *state,
 	 * Fill: a strong broadband accent while the groove is confident.  A
 	 * single accent plus the cooldown keeps it from chattering.
 	 */
-	if (onset_env >= MF_FILL_LEVEL &&
+	if (impact >= MF_FILL_LEVEL &&
 	    state->confidence >= (MF_BEAT_CONFIDENCE_LEVEL + 8U) &&
 	    mf_cooldown_ok(state, MUSIC_COOLDOWN_FILL)) {
 		events |= MUSIC_EVENT_FILL;
 		mf_cooldown_arm(state, MUSIC_COOLDOWN_FILL, MF_CD_FILL);
 		state->event_strength_q8 = (uint16_t)(
-			(uint32_t)onset_env << 8);
+			(uint32_t)impact << 8);
 	}
 
 	/* Cooldowns and event strength decay. */
