@@ -118,7 +118,19 @@ emitted correctly by `music_features_format_frame(..., feature_version=1, ...)`.
   period so a steady programme settles to near zero.
 - Tempo is estimated by autocorrelation of the onset envelope over lags
   spanning ~44–234 BPM; `bpm_x100` is published only while confidence is
-  sufficient, and confidence decays when the signal is beatless.
+  sufficient (≥ 32), and confidence decays when the signal is beatless.
+- The beat period is fractional (Q8 updates): the whole-period best lag is
+  re-measured at up to four beats (n × lag ± n/2, never past lag 64) and the
+  peak is refined by a parabola through its neighbours, then divided by n.  A
+  120 BPM beat is 11.72 updates; a whole lag reported 117.19 BPM.  The
+  metrical-level check compares peak mass (a lag plus its stronger neighbour),
+  since a fractional beat splits its score across two lags.
+- `beat_phase` advances by 65536 / period every update whenever a tempo is
+  published (confidence ≥ 32, previously ≥ 64, so it stood still on most real
+  music).  The first detected beat snaps it to zero; later beats pull it
+  halfway to zero, so motion stays smooth and whole-period onset timing
+  averages out.  `beat_confidence`, `groove` and `beat_strength` keep their
+  previous meaning and gates.
 - `kick`/`snare`/`high` come from per-group adaptive onset thresholds with a
   short refractory; these are ordinary beat/transient evidence, not structural
   events.
@@ -134,8 +146,8 @@ emitted correctly by `music_features_format_frame(..., feature_version=1, ...)`.
 ## Bounded resources and determinism
 
 - No allocation, no floating point in the analysis, no wall clock, no
-  randomness.  `struct music_features_state` is 312 bytes and
-  `struct audio_visualizer` is 512 bytes on the host (`x86-64`); fixed-size
+  randomness.  `struct music_features_state` is 316 bytes and
+  `struct audio_visualizer` is 516 bytes on the host (`x86-64`); fixed-size
   rings only.
 - The same synthetic PCM stream yields a bit-identical feature sequence on every
   run and host.  Host analysis cost is ~100 µs per 2048-frame period.
@@ -153,7 +165,12 @@ python3 tools/mt8163-arm32/airplay/test_music_feature_packet.py
   stable tempo clicks, differentiated low/mid/high bursts, warmth/brightness
   axes, build/drop, quiet gap and re-entry, a section change, a fill accent, a
   steady dense false-positive, beatless confidence decay, bit-identical replay,
-  the v1/v2 packet contract, bounded memory and host runtime.
+  the v1/v2 packet contract, bounded memory and host runtime.  It also builds
+  `test_beat_tracking.c`: sample-accurate kick and kit tracks at 100, 120 and
+  128 BPM, a swung 112 BPM kit and a 124 BPM track with noise must read within
+  ±1.5 BPM on every update with the phase advancing and near zero on beats; a
+  busy 118 BPM track with off-grid hits (confidence 32..63) must hold its
+  median tempo and keep the phase moving.
 - `test_music_feature_trace.sh` emits a deterministic JSONL trace of real
   version-2 packets for the cross-repository roundtrip.
 - `test_music_transport_wrap.sh` drives the real transport at the production
