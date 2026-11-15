@@ -1452,7 +1452,7 @@ class SourceTests(unittest.TestCase):
         self.assertIn("errno != EINPROGRESS && errno != EAGAIN", engine)
         self.assertIn("poll(&pollfd, 1, 0)", engine)
         self.assertIn("getsockopt(fd, SOL_SOCKET, SO_ERROR", engine)
-        self.assertIn("#define VISUALIZER_FRAME_PERIODS 2U", engine)
+        self.assertIn("#define VISUALIZER_FRAME_PERIODS 1U", engine)
         self.assertIn('\\"cmd\\":\\"visualizer\\"', engine)
         # The visualizer frame is emitted by the shared music-features
         # formatter (the mandatory visualizer-producer contract); the engine

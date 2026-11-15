@@ -4,7 +4,7 @@
 `audio_visualizer.c` into the frozen **version-2** visualizer feature frame that
 LibreEcho-UI replays for the scene director (UI #64) and the event-driven
 transition effects (UI #65).  `audio_engine.c` owns the transport: it packages
-one frame from the final post-limiter mono programme every second PCM period and
+one frame from the unity-gain music tap every PCM period (~23.4 frames/s) and
 sends it to the LED daemon on the existing owner-scoped socket.
 
 This unit **publishes bounded perceptual evidence, not exact instrument
@@ -125,8 +125,11 @@ emitted correctly by `music_features_format_frame(..., feature_version=1, ...)`.
 - Structural gates (`build`, `breakdown`, `reentry`, `section`, `drop`, `fill`)
   are multi-frame and cooldown-guarded.  A `drop` requires an armed build plus a
   dip-and-recovery or a high-impact downbeat, so an isolated loud hit never
-  opens it.  Event flags are latched for a few updates so an event that lands
-  between two emitted frames is still delivered.
+  opens it.  Event flags are latched for `MF_EVENT_HOLD` (4) updates, ~171 ms,
+  so an event survives a frame the LED daemon did not take.  With one frame per
+  period the same event therefore appears in up to four consecutive frames;
+  consumers treat the flags as level state behind their own cooldowns, never
+  as counted edges.
 
 ## Bounded resources and determinism
 

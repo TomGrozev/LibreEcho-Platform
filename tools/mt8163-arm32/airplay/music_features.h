@@ -141,7 +141,7 @@ struct music_features_state {
 	uint8_t section_frames;
 	uint16_t drop_window;
 	uint16_t cooldown[6];
-	/* Latch so a one-period event survives a multi-period frame cadence. */
+	/* Latch so a one-period event survives a frame ledd did not take. */
 	uint16_t event_latch;
 	uint8_t event_hold;
 	uint32_t period_index;
@@ -273,8 +273,11 @@ static inline void music_features_state_init(struct music_features_state *state)
 #define MF_CD_SECTION 144U
 #define MF_CD_DROP 168U
 #define MF_CD_FILL 72U
-/* Event flags are held for this many updates so an event that lands between
- * two emitted frames is still delivered by the next one. */
+/* Event flags are held for this many updates (~171 ms at 2048/48000).  The
+ * engine now sends a frame every update, so the hold no longer bridges a frame
+ * gap; it keeps the event visible for the same wall-clock time as before and
+ * still delivers it when one best-effort send is dropped.  Consumers treat the
+ * flags as level state gated by their own cooldowns, not as counted edges. */
 #define MF_EVENT_HOLD 4U
 
 static inline int mf_cooldown_ok(const struct music_features_state *state,
@@ -812,8 +815,9 @@ static inline void music_features_update(struct music_features_state *state,
 
 	/*
 	 * Latch event flags for a short hold.  The engine emits a frame every
-	 * second period, so a one-period kick/build/drop must survive until
-	 * the next frame instead of being silently lost.
+	 * period, but the send is best-effort, so a one-period kick/build/drop
+	 * stays set for MF_EVENT_HOLD periods instead of being lost with a
+	 * dropped frame.
 	 */
 	if (events != 0) {
 		state->event_latch |= events;
