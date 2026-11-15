@@ -79,7 +79,15 @@
 #define SOURCE_IDLE_PERIODS 8U
 #define AIRPLAY_ACK_GRACE_READS 24U
 #define MEDIA_DUCK_Q15 8231
-#define VISUALIZER_FRAME_PERIODS 2U
+/*
+ * One visualizer frame per 2048-frame period (~23.4 frames/s, ~42.7 ms).  The
+ * LED daemon re-renders every 33 ms from the latest frame, so a slower cadence
+ * left beat phase and onsets visibly stepped.  The send is a zero-wait,
+ * best-effort AF_UNIX request (send_led_request); events stay latched for
+ * MF_EVENT_HOLD periods in music_features.h, so a send that ledd drops does not
+ * lose a one-period event.
+ */
+#define VISUALIZER_FRAME_PERIODS 1U
 #define VISUALIZER_SILENT_PERIODS 24U
 #define VISUALIZER_BRIGHTNESS 70U
 

@@ -27,7 +27,7 @@
 #include <string.h>
 
 #define TRACE_FRAMES 2048U
-#define TRACE_FRAME_PERIODS 2U
+#define TRACE_FRAME_PERIODS 1U	/* engine cadence: one frame per period */
 #define TRACE_SESSION 0x2a2a0001U
 
 static uint32_t le32(const unsigned char *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }

@@ -166,7 +166,8 @@ the announcement bus becomes idle.
 For media-only playback, the engine analyzes the final post-limiter mono
 programme actually sent to the Puffin speaker profile. A fixed-point,
 12-band filter bank covers 63 Hz through 11 kHz and publishes owner-scoped
-visualizer frames to the LED daemon at about 11.7 frames/second. System,
+visualizer frames to the LED daemon once per 2048-frame period, about 23.4
+frames/second. System,
 announcement, or alarm activity immediately releases the `music` LED owner so
 the higher-priority indication wins; media visualization resumes only after
 those buses become idle. LED socket work is zero-wait and best-effort, so a
