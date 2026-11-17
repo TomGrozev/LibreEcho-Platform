@@ -152,6 +152,34 @@ by the stored configuration, so these are independently designed substitutes,
 **not a claim of stock acoustic parity**. Human listening and level-matched
 spectral/dynamic tests remain required before a release.
 
+The owner equaliser and speaker boost sit on that mono bus after the stock
+loudness EQ and before each chain's protection (MBCL on Radar-Puffin, the
+compressors and full-band limiter on the Echo Dot), so they never bypass it.
+audiod publishes them into the audio runtime root, writing each file
+atomically (temp file in the same directory, then rename) and removing it
+for the flat/off setting. `tone.conf` schema 2 is the four-band equaliser,
+each key exactly once in any order, values `-6.00..6.00` dB:
+
+```text
+schema=2
+bass_db=<v>       low shelf, 120 Hz
+low_mid_db=<v>    peak, 400 Hz, Q 0.9
+high_mid_db=<v>   peak, 2.5 kHz, Q 0.9
+treble_db=<v>     high shelf, 6 kHz
+```
+
+The earlier schema 1 (`bass_db` and `treble_db` only) is still accepted, with
+the two mid bands flat. `boost.conf` is `schema=1` and `boost_db=0|3|6`. A
+missing file is flat / 0 dB, and any parse error rejects the whole file as
+flat / 0 dB. A band at 0 dB is not run, so all four at 0 dB with no boost is
+the stock chain sample for sample (`test_owner_eq_flat_equivalence.py`). The
+engine reads both files at playback start and, while playing, stats them
+every 12 periods (about 0.5 s) and re-reads only a file whose stat changed.
+A change is crossfaded in over one 2048-frame period (old and new band sets
+run side by side) and a new boost is ramped over one period, so it does not
+click (`test_owner_settings_engine.py`, `test_speaker_dsp.sh`,
+`test_biscuit_speaker_dsp.sh`).
+
 This two-channel container is mandatory even though programme semantics remain
 mono. The superseded one-channel `MonoRight` / `DACSETUP=0x24` transport made
 the woofer play while the tweeter carried noise or silence. LO/LOL/LOR are a
