@@ -47,6 +47,8 @@ python3 "$SCRIPT_DIR/test_wide_output.py"
 "$SCRIPT_DIR/test_music_avl.sh"
 python3 "$SCRIPT_DIR/test_music_avl_engine.py"
 python3 "$SCRIPT_DIR/test_reply_volume_engine.py"
+python3 "$SCRIPT_DIR/test_owner_settings_engine.py"
+python3 "$SCRIPT_DIR/test_owner_eq_flat_equivalence.py"
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }

@@ -3,9 +3,10 @@
 
 /*
  * Owner speaker gain boost for the speaker chains.  The setting is published
- * into the audio runtime root (boost.conf) and read once per playback start,
- * like tone.conf.  Off (0 dB) is the stock sound: a missing file, or any file
- * that does not parse exactly, selects it.
+ * into the audio runtime root (boost.conf), read at playback start and
+ * re-read while playing when its stat changes, like tone.conf; a live change
+ * ramps over one period.  Off (0 dB) is the stock sound: a missing file, or
+ * any file that does not parse exactly, selects it.
  *
  *   schema=1
  *   boost_db=<0|3|6>
