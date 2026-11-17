@@ -29,6 +29,7 @@
 #include <tinyalsa/pcm.h>
 
 #include "aec_reference.h"
+#include "airplay_delay.h"
 #include "audio_period_buffer.h"
 #include "audio_sink.h"
 #include "audio_timing.h"
@@ -38,6 +39,8 @@
 #include "puffin_downmix.h"
 #include "speaker_dsp.h"
 #include "biscuit_speaker_dsp.h"
+#include "speaker_tone.h"
+#include "speaker_boost.h"
 #include "music_avl.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
@@ -46,7 +49,10 @@
 #define AIRPLAY_MASTER_FILE "airplay.master"
 #define AIRPLAY_RESET_FILE "airplay.reset"
 #define AIRPLAY_RESET_ACK_FILE "airplay.reset-ack"
+#define AIRPLAY_ENGINE_DELAY_FILE "airplay.engine-delay"
 #define MASTER_VOLUME_FILE "master.volume"
+#define TONE_SETTINGS_FILE "tone.conf"
+#define BOOST_SETTINGS_FILE "boost.conf"
 #define IMAGE_TARGET_FILE "/etc/libreecho/target"
 /* airplayd chroots the engine into the feature root, which does not carry
  * the image identity; the host /proc is mounted there, so PID 1's root is. */
@@ -73,7 +79,15 @@
 #define SOURCE_IDLE_PERIODS 8U
 #define AIRPLAY_ACK_GRACE_READS 24U
 #define MEDIA_DUCK_Q15 8231
-#define VISUALIZER_FRAME_PERIODS 2U
+/*
+ * One visualizer frame per 2048-frame period (~23.4 frames/s, ~42.7 ms).  The
+ * LED daemon re-renders every 33 ms from the latest frame, so a slower cadence
+ * left beat phase and onsets visibly stepped.  The send is a zero-wait,
+ * best-effort AF_UNIX request (send_led_request); events stay latched for
+ * MF_EVENT_HOLD periods in music_features.h, so a send that ledd drops does not
+ * lose a one-period event.
+ */
+#define VISUALIZER_FRAME_PERIODS 1U
 #define VISUALIZER_SILENT_PERIODS 24U
 #define VISUALIZER_BRIGHTNESS 70U
 
@@ -1300,6 +1314,74 @@ static int32_t read_media_gain(const char *root)
 	return db_to_q15(db);
 }
 
+/*
+ * Separate reply volume (LibreEcho-UI #409).  audiod publishes the owner's
+ * assistant-reply level beside master.volume as reply.volume, in the same
+ * logical 0..100 form; the file is absent while replies follow the master.
+ * When present, the system bus (Home Assistant and live-voice replies,
+ * chimes) and the announcement bus (local speech) are mixed apart from the
+ * master-scaled buses and take the logical gain of the reply level instead,
+ * on the same taper, so a reply at level R sounds as loud as everything does
+ * at master R.  Both sums then meet the shared speaker chain.  The reply gain
+ * ramps across a period like the master does, so moving either level never
+ * steps.  Media, AirPlay, Sendspin and the alarm bus keep the master level;
+ * a master of zero (mute) still silences everything.
+ */
+#define REPLY_VOLUME_FILE "reply.volume"
+static int reply_volume_percent = -1;   /* -1: replies follow the master */
+static int32_t reply_target_q15 = -1;
+static int32_t reply_current_q15 = -1;
+static int32_t logical_master_gain(int percent);
+static int logical_master_volume(const char *root);
+
+static int read_reply_volume(const char *root)
+{
+	char path[256], text[16], *end;
+	struct stat st;
+	int fd, n;
+	long value;
+
+	n = snprintf(path, sizeof(path), "%s/%s", root, REPLY_VOLUME_FILE);
+	if (n < 0 || n >= (int)sizeof(path))
+		return -1;
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+	    st.st_size <= 0 || st.st_size >= (off_t)sizeof(text)) {
+		close(fd);
+		return -1;
+	}
+	n = (int)read(fd, text, (size_t)st.st_size);
+	close(fd);
+	if (n != st.st_size)
+		return -1;
+	text[n] = '\0';
+	errno = 0;
+	value = strtol(text, &end, 10);
+	if (errno || end == text || (*end != '\n' && *end != '\0') ||
+	    (*end == '\n' && end[1] != '\0') || value < 0 || value > 100)
+		return -1;
+	return (int)value;
+}
+
+/* Refresh the reply level once per period, beside the master read. */
+static void apply_reply_volume(const char *root)
+{
+	reply_volume_percent = read_reply_volume(root);
+	if (reply_volume_percent < 0)
+		reply_target_q15 = -1;
+	else if (logical_master_volume(root) <= 0)
+		reply_target_q15 = 0;
+	else
+		reply_target_q15 = logical_master_gain(reply_volume_percent);
+}
+
+static int reply_bus(unsigned int source)
+{
+	return source == SOURCE_SYSTEM || source == SOURCE_ANNOUNCEMENT;
+}
+
 static int setup_sources(struct source_bus *sources, const char *root)
 {
 	static const char *const names[SOURCE_COUNT] = {
@@ -1392,6 +1474,126 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 	return poll_sources_ex(sources, timeout_ms, 0);
 }
 
+/*
+ * Output-delay channel for Shairport (see airplay_delay.h).  The engine is the
+ * only place that knows how much AirPlay audio is queued past the media FIFO
+ * and how deep the ALSA ring is, so it publishes that, with a monotonic
+ * timestamp and a cumulative count of the bytes it has read from the FIFO, in
+ * a fixed-size seqlock page under the RAM bus root.  The bridge adds its own
+ * part and Shairport's delay() reads the total.  Single-threaded: published
+ * after every read_sources() batch and every period write, so a snapshot is
+ * never older than one 20 ms poll tick (idle) or one 2048-frame period.
+ */
+static uint64_t g_airplay_media_read_bytes;
+static struct le_ad_engine_pub g_airplay_delay;
+
+/*
+ * Output start time (issue #356).  Starting the output (arm, open, prepare,
+ * verify, power, first write) blocks this single thread for about a second
+ * (mostly one codec-driver prepare), so no snapshot can be published meanwhile
+ * and the AirPlay delay would otherwise go stale and ignore the wait.  While
+ * g_output_start_due_ns is set, "starting" snapshots carry it: the monotonic
+ * time at which the PCM is expected to start draining.  The expectation is the
+ * duration measured on the previous successful start (RAM only), initially a
+ * default for the first start after the engine starts.  A short promise is not
+ * harmless: on the Radar a 1.2 s default against a 1.45 s start made Shairport
+ * drop ~37 late packets on that first session.  Radar and Dot both measure
+ * 1.43-1.51 s, so the default sits at the top of that range.
+ */
+#define OUTPUT_START_DEFAULT_NS 1500000000ULL
+#define OUTPUT_START_MIN_NS 50000000ULL
+#define OUTPUT_START_MAX_NS 3000000000ULL
+static uint64_t g_output_start_est_ns = OUTPUT_START_DEFAULT_NS;
+static uint64_t g_output_start_due_ns;
+/* The last publish that had a PCM: when its ALSA level was true, the level and
+ * whether it is a real measurement. */
+static uint64_t g_pcm_publish_at;
+static uint32_t g_pcm_publish_alsa;
+static int g_pcm_publish_valid;
+
+static void airplay_delay_publish(struct pcm *pcm,
+				  const struct source_bus *sources)
+{
+	const struct source_bus *ap = &sources[SOURCE_AIRPLAY];
+	unsigned int avail = 0;
+	struct timespec stamp;
+	uint64_t now = le_ad_now_ns();
+	uint64_t at = now;
+	uint32_t alsa = 0;
+	int alsa_valid = 1;
+	int playing = pcm != NULL && !ap->airplay_volume_missing;
+
+	if (!g_airplay_delay.page)
+		return;
+	if (pcm) {
+		unsigned int buffer = pcm_get_buffer_size(pcm);
+
+		if (pcm_get_htimestamp(pcm, &avail, &stamp) == 0 &&
+		    buffer >= avail) {
+			uint64_t ts = (uint64_t)stamp.tv_sec * 1000000000ULL +
+				      (uint64_t)stamp.tv_nsec;
+
+			alsa = buffer - avail;
+			/* The ALSA timestamp is the moment the level was true. */
+			if (ts != 0 && ts <= now)
+				at = ts;
+		} else {
+			alsa_valid = 0;
+		}
+	}
+	if (pcm) {
+		g_pcm_publish_at = at;
+		g_pcm_publish_alsa = alsa;
+		g_pcm_publish_valid = alsa_valid;
+	}
+	le_ad_engine_publish(&g_airplay_delay, at, g_airplay_media_read_bytes,
+			     (uint32_t)(ap->received / (INPUT_CHANNELS * sizeof(int16_t))),
+			     alsa, alsa_valid, playing,
+			     pcm ? 0 : g_output_start_due_ns);
+}
+
+/*
+ * Called right after the first publish with the started PCM; start_ns is when
+ * the start began.  Learns how long a start takes, defined as the time until
+ * the PCM actually began consuming frames, so the delay reported before and
+ * after that instant is the same figure:
+ *
+ * - Before it, a "starting" snapshot reports the queued frames plus the wait
+ *   (due - now), so it falls with time down to the queued frames at the due
+ *   time.
+ * - After it, the snapshot reports queued + ALSA frames and falls at the DAC
+ *   rate from the moment draining began.
+ *
+ * The PCM is opened with start_threshold 1, so draining begins with the first
+ * write; write_period() writes whole periods (silence_size 0: no prefill by the
+ * library), and the ALSA ring holds whole periods minus what has drained since.
+ * The drain of the first publish therefore is  periods * PERIOD_SIZE - alsa
+ * frames (periods = ceil(alsa / PERIOD_SIZE)), always less than one period
+ * because the publish follows the write by a few milliseconds.  The drain began
+ * that many frames before the level's timestamp, which gives the start instant.
+ * An unmeasured ALSA level keeps the previous estimate.
+ */
+static void output_start_measured(uint64_t start_ns)
+{
+	uint64_t periods, drained, drained_ns, at, begin, est;
+
+	if (!g_airplay_delay.page || !g_pcm_publish_valid || start_ns == 0)
+		return;
+	at = g_pcm_publish_at;
+	if (at <= start_ns)
+		return;
+	periods = (g_pcm_publish_alsa + PERIOD_SIZE - 1U) / PERIOD_SIZE;
+	drained = periods * PERIOD_SIZE - g_pcm_publish_alsa;
+	drained_ns = drained * 1000000000ULL / DEFAULT_RATE;
+	begin = at - start_ns > drained_ns ? at - drained_ns : start_ns;
+	est = begin - start_ns;
+	if (est < OUTPUT_START_MIN_NS)
+		est = OUTPUT_START_MIN_NS;
+	if (est > OUTPUT_START_MAX_NS)
+		est = OUTPUT_START_MAX_NS;
+	g_output_start_est_ns = est;
+}
+
 /* The dedicated AirPlay FIFO is never reclassified as generic media. */
 static int discard_disconnected_media(struct source_bus *media)
 {
@@ -1404,6 +1606,7 @@ static int discard_disconnected_media(struct source_bus *media)
 		ssize_t n = read(media->fd, input, sizeof(input));
 		if (n > 0) {
 			drained += (size_t)n;
+			g_airplay_media_read_bytes += (uint64_t)n;
 			if (drained > media->capacity * 4)
 				return -1; /* fail closed if a producer never quiesces */
 			continue;
@@ -1429,6 +1632,76 @@ static int airplay_marker_stat(const char *root, struct stat *marker)
 	int n = snprintf(path, sizeof(path), "%s/%s", root, AIRPLAY_ACTIVE_FILE);
 	return n > 0 && n < (int)sizeof(path) &&
 	       lstat(path, marker) == 0 && S_ISREG(marker->st_mode);
+}
+
+/*
+ * AirPlay session boundary (issue #356).  When the session marker disappears
+ * or is replaced, audio the engine already committed for the ended session
+ * (the ALSA ring, ~3000 frames) must not play after the boundary, or Stop ->
+ * new song and Pause -> resume play a ~0.1 s tail of the old audio.  The
+ * bridge's held bytes, the media FIFO and the engine's own AirPlay queue are
+ * dropped by the reset/discard paths above; this is the remaining downstream
+ * part: read_sources() notes the boundary and the playback loop, which owns
+ * the PCM, stops (drops) and re-prepares it before the next period.
+ *
+ * Fencing: the drop runs between read_sources() and the next write, so it can
+ * only remove periods written before the boundary was observed; a new
+ * session's audio is read into the AirPlay queue by that same read_sources()
+ * call and written afterwards.  A flush with an unchanged marker (skip, seek)
+ * is not a boundary and keeps playing the ring out as before.  The drop is
+ * skipped while any other bus or a Sendspin generation shares the ring, so
+ * TTS, alarms and Sendspin are never cut.
+ */
+static int g_airplay_marker_valid;
+static struct stat g_airplay_live_marker;
+static int g_airplay_drop_pending;
+static unsigned int g_airplay_drops, g_airplay_drops_shared;
+
+static void note_airplay_boundary(int airplay, const struct stat *marker)
+{
+	if (g_airplay_marker_valid &&
+	    (!airplay || !same_marker(marker, &g_airplay_live_marker))) {
+		g_airplay_marker_valid = 0;
+		g_airplay_drop_pending = 1;
+	}
+	if (airplay && !g_airplay_marker_valid) {
+		g_airplay_live_marker = *marker;
+		g_airplay_marker_valid = 1;
+	}
+}
+
+/* Drop what the ALSA ring still holds for an ended AirPlay session.  Called
+ * by the playback loop right after read_sources().  No PCM (nothing queued),
+ * or a ring shared with another bus, means there is nothing safe to drop. */
+static void drop_airplay_downstream(struct pcm *pcm,
+				    const struct source_bus *sources)
+{
+	unsigned int i;
+
+	if (!g_airplay_drop_pending)
+		return;
+	g_airplay_drop_pending = 0;
+	if (!pcm)
+		return;
+	for (i = 0; i < SOURCE_COUNT; ++i)
+		if (i != SOURCE_AIRPLAY &&
+		    (sources[i].idle_periods > 0 || sources[i].received > 0))
+			goto shared;
+	if (sendspin_live(&g_sendspin) || sendspin_held(&g_sendspin) ||
+	    g_sendspin.have_generation)
+		goto shared;
+	if (pcm_stop(pcm) < 0 || pcm_prepare(pcm) < 0) {
+		fprintf(stderr, "audio-engine: airplay session end: PCM drop failed: %s\n",
+			pcm_get_error(pcm));
+		return;
+	}
+	++g_airplay_drops;
+	fprintf(stderr, "audio-engine: airplay session ended or replaced: "
+		"ALSA ring dropped (%u drops)\n", g_airplay_drops);
+	airplay_delay_publish(pcm, sources);
+	return;
+shared:
+	++g_airplay_drops_shared;
 }
 
 /* Hooks hold the forwarding lock until this exact-token acknowledgement.
@@ -1500,6 +1773,7 @@ static int read_sources(struct source_bus *sources, const char *root)
 	                !same_marker(&marker, &ap->airplay_marker)) &&
 	    !ap->airplay_reset_pending)
 		airplay = 0; /* replacement without a reset is not a generation */
+	note_airplay_boundary(airplay, &marker);
 
 	if (!airplay || !ap->airplay_session_seen ||
 	    !same_marker(&marker, &ap->airplay_marker)) {
@@ -1548,6 +1822,8 @@ static int read_sources(struct source_bus *sources, const char *root)
 			n = read(sources[i].fd, input, read_bytes);
 
 			if (n > 0) {
+				if (i == SOURCE_AIRPLAY)
+					g_airplay_media_read_bytes += (uint64_t)n;
 				appended = le_audio_period_buffer_append(
 					cursor, &sources[i].received, sources[i].capacity,
 					input, (size_t)n);
@@ -1581,6 +1857,7 @@ static int read_sources(struct source_bus *sources, const char *root)
 	ap->airplay_volume_missing = airplay && !ap->airplay_admitted;
 	ap->gain_q15 = ap->airplay_last_gain;
 	sources[SOURCE_MEDIA].gain_q15 = read_media_gain(root);
+	apply_reply_volume(root);
 	return received_any;
 }
 
@@ -1637,6 +1914,7 @@ static int wait_for_period(struct source_bus *sources, const char *root)
 	while (!stopping && !period_ready(sources)) {
 		if (!sources_active(sources))
 			return 0;
+		airplay_delay_publish(NULL, sources);
 		if (poll_sources(sources, 20) < 0)
 			return -1;
 		if (read_sources(sources, root) < 0)
@@ -1775,7 +2053,8 @@ static int32_t mix_sources_frame(const struct source_bus *sources,
 
 		if (!source_period_ready(&sources[source]) ||
 		    (source == SOURCE_AIRPLAY &&
-		     sources[source].airplay_volume_missing))
+		     sources[source].airplay_volume_missing) ||
+		    (reply_target_q15 >= 0 && reply_bus(source)))
 			continue;
 		mono = (int32_t)sources[source].samples[
 			frame * INPUT_CHANNELS] +
@@ -1809,6 +2088,24 @@ static int32_t mix_sources_frame(const struct source_bus *sources,
 		else if (higher_priority)
 			gain = (gain * MEDIA_DUCK_Q15) >> 15;
 		mixed += (int32_t)(((int64_t)mono * gain) >> 15);
+	}
+	return mixed;
+}
+
+/* The reply buses alone, at unity, while a separate reply level is set. */
+static int32_t mix_reply_frame(const struct source_bus *sources, size_t frame)
+{
+	int32_t mixed = 0;
+	unsigned int source;
+
+	for (source = 0; source < SOURCE_COUNT; ++source) {
+		int32_t mono;
+
+		if (!reply_bus(source) || !source_period_ready(&sources[source]))
+			continue;
+		mono = ((int32_t)sources[source].samples[frame * INPUT_CHANNELS] +
+			(int32_t)sources[source].samples[frame * INPUT_CHANNELS + 1]) / 2;
+		mixed += (int32_t)(((int64_t)mono * sources[source].gain_q15) >> 15);
 	}
 	return mixed;
 }
@@ -1975,6 +2272,186 @@ static void select_speaker_profile(void)
 }
 
 /*
+ * Owner settings files.  Both are read at playback start and watched while
+ * playing: every OWNER_SETTINGS_POLL_PERIODS periods (12 x 2048 frames, about
+ * 0.5 s) the engine stats them, and re-reads only a file whose stat changed.
+ * A changed setting is crossfaded in over one period by the chains.
+ * owner_settings.reads counts file reads (host tests check it stays put).
+ */
+#define OWNER_SETTINGS_POLL_PERIODS 12U
+
+struct owner_file_key {
+	int present;
+	dev_t dev;
+	ino_t ino;
+	off_t size;
+	struct timespec mtime, ctime;
+};
+
+static struct {
+	unsigned int periods;
+	struct owner_file_key tone, boost;
+	unsigned long reads;
+} owner_settings;
+
+static void owner_file_key_get(const char *root, const char *name,
+			       struct owner_file_key *key)
+{
+	char path[256];
+	struct stat st;
+	int n;
+
+	memset(key, 0, sizeof(*key));
+	n = snprintf(path, sizeof(path), "%s/%s", root, name);
+	if (n < 0 || n >= (int)sizeof(path) || lstat(path, &st) != 0)
+		return;
+	key->present = 1;
+	key->dev = st.st_dev;
+	key->ino = st.st_ino;
+	key->size = st.st_size;
+	key->mtime = st.st_mtim;
+	key->ctime = st.st_ctim;
+}
+
+static int owner_file_key_same(const struct owner_file_key *a,
+			       const struct owner_file_key *b)
+{
+	if (!a->present || !b->present)
+		return a->present == b->present;
+	return a->dev == b->dev && a->ino == b->ino && a->size == b->size &&
+	       a->mtime.tv_sec == b->mtime.tv_sec &&
+	       a->mtime.tv_nsec == b->mtime.tv_nsec &&
+	       a->ctime.tv_sec == b->ctime.tv_sec &&
+	       a->ctime.tv_nsec == b->ctime.tv_nsec;
+}
+
+/*
+ * Owner equaliser from <root>/tone.conf (schema 1 or 2, speaker_tone.h).  A
+ * missing or rejected file is flat, which is the stock sound.  The bands sit
+ * on the mono bus before the chain's protection, so they cannot bypass MBCL.
+ */
+static void load_owner_tone(const char *root, struct speaker_tone *out)
+{
+	char path[256], text[192];
+	int n, rc;
+
+	speaker_tone_flat(out);
+	n = snprintf(path, sizeof(path), "%s/%s", root, TONE_SETTINGS_FILE);
+	if (n < 0 || n >= (int)sizeof(path))
+		return;
+	++owner_settings.reads;
+	rc = read_small_file(path, text, sizeof(text));
+	if (rc < 0)
+		return;
+	if (rc == 0 || !speaker_tone_parse(text, out)) {
+		fprintf(stderr, "audio-engine: tone settings rejected; using flat\n");
+		speaker_tone_flat(out);
+	}
+}
+
+/*
+ * Owner gain boost from <root>/boost.conf.  A missing or rejected file is
+ * 0 dB, which is the stock sound.  The makeup is applied ahead of the chain's
+ * protection, so it cannot bypass it.
+ */
+static void load_owner_boost(const char *root, float *out_db)
+{
+	char path[256], text[128];
+	int n, rc;
+
+	*out_db = 0.0f;
+	n = snprintf(path, sizeof(path), "%s/%s", root, BOOST_SETTINGS_FILE);
+	if (n < 0 || n >= (int)sizeof(path))
+		return;
+	++owner_settings.reads;
+	rc = read_small_file(path, text, sizeof(text));
+	if (rc < 0)
+		return;
+	if (rc == 0 || !speaker_boost_parse(text, out_db)) {
+		fprintf(stderr, "audio-engine: boost settings rejected; using 0 dB\n");
+		*out_db = 0.0f;
+	}
+}
+
+static void log_owner_tone(const struct speaker_tone *t, const char *when)
+{
+	fprintf(stderr, "audio-engine: owner tone%s bass %+.1f low-mid %+.1f "
+		"high-mid %+.1f treble %+.1f dB\n", when, (double)t->bass_db,
+		(double)t->low_mid_db, (double)t->high_mid_db, (double)t->treble_db);
+}
+
+/* Playback start: read both files and apply them at once (no history yet). */
+static void apply_owner_settings(const char *root, struct speaker_dsp *speaker)
+{
+	struct speaker_tone tone;
+	float boost_db;
+
+	/* Stat before reading: a write racing the read is seen by the next poll. */
+	owner_file_key_get(root, TONE_SETTINGS_FILE, &owner_settings.tone);
+	owner_file_key_get(root, BOOST_SETTINGS_FILE, &owner_settings.boost);
+	owner_settings.periods = 0;
+	load_owner_tone(root, &tone);
+	load_owner_boost(root, &boost_db);
+	speaker_dsp_set_tone(speaker, tone.bass_db, tone.low_mid_db,
+			     tone.high_mid_db, tone.treble_db);
+	speaker_dsp_set_boost(speaker, boost_db);
+	if (biscuit_chain) {
+		biscuit_dsp_set_tone(biscuit_chain, tone.bass_db, tone.low_mid_db,
+				     tone.high_mid_db, tone.treble_db);
+		biscuit_dsp_set_boost(biscuit_chain, boost_db);
+	}
+	if (!speaker_tone_is_flat(&tone))
+		log_owner_tone(&tone, "");
+	if (boost_db != 0.0f)
+		fprintf(stderr, "audio-engine: owner boost %+.1f dB\n", (double)boost_db);
+}
+
+/*
+ * While playing, once per period: every OWNER_SETTINGS_POLL_PERIODS periods
+ * stat both files and re-read only a changed one.  The chains crossfade the
+ * new equaliser and ramp the new boost over one period.  A file removed after
+ * a change is flat / 0 dB.  Returns 1 when a setting was re-read.
+ */
+static int poll_owner_settings(const char *root, struct speaker_dsp *speaker)
+{
+	struct owner_file_key key;
+	int reread = 0;
+
+	if (++owner_settings.periods < OWNER_SETTINGS_POLL_PERIODS)
+		return 0;
+	owner_settings.periods = 0;
+	owner_file_key_get(root, TONE_SETTINGS_FILE, &key);
+	if (!owner_file_key_same(&key, &owner_settings.tone)) {
+		struct speaker_tone tone;
+
+		owner_settings.tone = key;
+		load_owner_tone(root, &tone);
+		speaker_dsp_fade_tone(speaker, tone.bass_db, tone.low_mid_db,
+				      tone.high_mid_db, tone.treble_db);
+		if (biscuit_chain)
+			biscuit_dsp_fade_tone(biscuit_chain, tone.bass_db,
+					      tone.low_mid_db, tone.high_mid_db,
+					      tone.treble_db);
+		log_owner_tone(&tone, " changed:");
+		reread = 1;
+	}
+	owner_file_key_get(root, BOOST_SETTINGS_FILE, &key);
+	if (!owner_file_key_same(&key, &owner_settings.boost)) {
+		float boost_db;
+
+		owner_settings.boost = key;
+		load_owner_boost(root, &boost_db);
+		speaker_dsp_fade_boost(speaker, boost_db);
+		if (biscuit_chain)
+			biscuit_dsp_fade_boost(biscuit_chain, boost_db);
+		fprintf(stderr, "audio-engine: owner boost changed: %+.1f dB\n",
+			(double)boost_db);
+		reread = 1;
+	}
+	return reread;
+}
+
+/*
  * Wide output state.  With a 24-bit-capable kernel the PCM is S32_LE and the
  * chain stays in float from the master gain to the DAC: 16-bit volume
  * arithmetic otherwise drops one bit per 6 dB of attenuation.  The int16
@@ -2027,10 +2504,16 @@ static void render_period(struct source_bus *sources,
 {
 	size_t frame;
 	float avl_start = avl_gain, avl_end = music_avl_period_gain(sources);
+	int reply_separate = reply_target_q15 >= 0;
 
 	avl_gain = avl_end;
+	/* A newly separate reply level starts from the master it replaces. */
+	if (!reply_separate)
+		reply_current_q15 = -1;
+	else if (reply_current_q15 < 0)
+		reply_current_q15 = *current_master_q15;
 	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
-		int32_t mixed;
+		int32_t mixed, reply = 0;
 
 		/* Ramp the AVL boost across the period: no per-period steps. */
 		avl_frame_q15 = (int32_t)lrintf(32768.0f *
@@ -2038,8 +2521,13 @@ static void render_period(struct source_bus *sources,
 			 (float)(frame + 1) / (float)PERIOD_SIZE));
 		mixed = mix_sources_frame(sources, sendspin, sendspin_frames,
 						  frame);
+		if (reply_separate) {
+			reply = mix_reply_frame(sources, frame);
+			reply_current_q15 += (reply_target_q15 - reply_current_q15) /
+				(int32_t)(PERIOD_SIZE - frame);
+		}
 #ifdef LE_ENGINE_LATENCY_TRACE
-		trace_input[frame] = mixed;
+		trace_input[frame] = mixed + reply;
 #endif
 		int16_t rendered;
 		*current_master_q15 += (target_master_q15 - *current_master_q15) /
@@ -2050,6 +2538,10 @@ static void render_period(struct source_bus *sources,
 			float wide = (float)mixed *
 				((float)*current_master_q15 / 32768.0f);
 			float y;
+
+			if (reply_separate)
+				wide += (float)reply *
+					((float)reply_current_q15 / 32768.0f);
 
 			if (biscuit_chain)
 				y = biscuit_dsp_process(biscuit_chain,
@@ -2070,6 +2562,8 @@ static void render_period(struct source_bus *sources,
 			continue;
 		}
 		mixed = (int32_t)(((int64_t)mixed * *current_master_q15) >> 15);
+		if (reply_separate)
+			mixed += (int32_t)(((int64_t)reply * reply_current_q15) >> 15);
 		/* All producer buses meet here: mono EQ, then multiband
 		 * protection, then the +3 dB trim and final PCM safety limiter. */
 		if (biscuit_chain) {
@@ -2173,6 +2667,13 @@ static int speaker_volume_percent(const struct source_bus *sources, int master)
 		gain = sources[SOURCE_MEDIA].gain_q15;
 	if (airplay_ready && sources[SOURCE_AIRPLAY].gain_q15 > gain)
 		gain = sources[SOURCE_AIRPLAY].gain_q15;
+	/* A reply at its own level is what is audible over ducked media, so it
+	 * picks the loudness preset; an alarm keeps the master's. */
+	if (reply_target_q15 >= 0 && master > 0 &&
+	    !source_period_ready(&sources[SOURCE_ALARM]) &&
+	    (source_period_ready(&sources[SOURCE_SYSTEM]) ||
+	     source_period_ready(&sources[SOURCE_ANNOUNCEMENT])))
+		master = reply_volume_percent;
 	return speaker_volume_percent_for_mix(master, gain,
 		media_ready || airplay_ready, higher_priority_active(sources));
 }
@@ -2207,6 +2708,7 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 			speaker_volume_percent(sources, master_volume));
 		biscuit_dsp_configure(biscuit_chain, speaker_profile.bass_makeup_db);
 	}
+	apply_owner_settings(root, speaker);
 	*master_gain = logical_master_gain(master_volume);
 	(void)sendspin_stage(&g_sendspin);
 	render_period(sources, g_sendspin.stage, g_sendspin.stage_frames, output,
@@ -2394,6 +2896,18 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			"audio-engine: AEC reference tap unavailable: %s\n",
 			strerror(errno));
 	sync_playback_status(sources, &status);
+	{
+		char delay_path[256];
+
+		memset(&g_airplay_delay, 0, sizeof(g_airplay_delay));
+		g_airplay_media_read_bytes = 0;
+		if (snprintf(delay_path, sizeof(delay_path), "%s/%s", root,
+			     AIRPLAY_ENGINE_DELAY_FILE) >= (int)sizeof(delay_path) ||
+		    le_ad_engine_open(&g_airplay_delay, delay_path) < 0)
+			fprintf(stderr,
+				"audio-engine: AirPlay delay channel unavailable: %s\n",
+				strerror(errno));
+	}
 	/* Bind the framed sink now, even while the PCM is idle, so an SDK can
 	 * open a generation and begin priming before any legacy FIFO period. */
 	{
@@ -2440,9 +2954,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	while (!stopping) {
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
+		uint64_t start_began_ns = 0;
 		int ready;
 		int poll_timeout = 20; /* service resets even when all buses are idle */
 
+		/* Idle snapshot, taken before the wait: its FIFO counter and queue
+		 * are a consistent pair, and the poll bounds its age to one tick. */
+		g_output_start_due_ns = 0;
+		airplay_delay_publish(NULL, sources);
 		if (poll_sources_ex(sources, poll_timeout, 1) < 0)
 			break;
 		if (stopping)
@@ -2485,18 +3004,31 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"volume is unavailable\n");
 		}
 		SENDSPIN_TRACE("s-prepared");
+		/* Start path (arm, open, prepare, verify, power, first write): the
+		 * engine reads no FIFO and writes no period for a while.  Publish a
+		 * truthful "starting" snapshot (PCM not draining, the first period
+		 * still queued, nothing in ALSA) between the steps so delay() keeps
+		 * answering instead of going stale (LE_AD_STALE_NS) (issue #356).
+		 * They also carry when the PCM is expected to start draining, which
+		 * covers the long blocking steps; every exit below clears it. */
+		start_began_ns = le_ad_now_ns();
+		g_output_start_due_ns = start_began_ns + g_output_start_est_ns;
+		airplay_delay_publish(NULL, sources);
 		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
+			g_output_start_due_ns = 0;
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
 		}
 		SENDSPIN_TRACE("s-armed");
+		airplay_delay_publish(NULL, sources);
 		pcm = open_output_pcm(card, device, &config);
 		if (!pcm || !pcm_is_ready(pcm)) {
 			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
 				card, device,
 				pcm ? pcm_get_error(pcm) : "open failed");
+			g_output_start_due_ns = 0;
 			if (pcm)
 				pcm_close(pcm);
 			(void)disable_output_controls(card);
@@ -2505,6 +3037,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			usleep(250000);
 			continue;
 		}
+		/* A fresh PCM has an empty ring: a boundary seen before the open
+		 * has nothing to drop, and one seen after it is a new event. */
+		g_airplay_drop_pending = 0;
+		airplay_delay_publish(NULL, sources);
 		/* The clock domain is declared only because the PCM was opened
 		 * monotonic.  A chain without a measured output latency stays
 		 * uncalibrated, so its finish estimates remain invalid (fail
@@ -2530,17 +3066,21 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		/* The codec stays at its safe fixed reference; software owns gain. */
 		int playback_start_failed = 0;
 		SENDSPIN_TRACE("s-opened");
+		airplay_delay_publish(NULL, sources);
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
 		else {
 			SENDSPIN_TRACE("s-prepare");
+			airplay_delay_publish(NULL, sources);
 			if (verify_codec_reference(card) < 0)
 				playback_start_failed = 1;
 			SENDSPIN_TRACE("s-verified");
+			airplay_delay_publish(NULL, sources);
 			if (!playback_start_failed && power_output_controls(card) < 0)
 				playback_start_failed = 1;
 			SENDSPIN_TRACE("s-powered");
+			airplay_delay_publish(NULL, sources);
 			if (!playback_start_failed) {
 				/* Queue the first period only after amp settle.  The PCM starts
 				 * muted, and unmute follows this write. */
@@ -2565,6 +3105,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
+			g_output_start_due_ns = 0;
 			sendspin_close_timing(&g_sendspin);
 			(void)disable_output_controls(card);
 			pcm_close(pcm);
@@ -2574,6 +3115,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		process_music_visualizer(&visualizer, sources);
 		consume_period(sources);
+		g_output_start_due_ns = 0;
+		airplay_delay_publish(pcm, sources);
+		output_start_measured(start_began_ns);
 
 		while (!stopping && sources_active(sources)) {
 			/* A live Sendspin generation paces every period itself
@@ -2589,6 +3133,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				stopping = 1;
 				break;
 			}
+			drop_airplay_downstream(pcm, sources);
 			if (!period_ready(sources))
 				break;
 			sync_announcement_led(sources, &announcement_led_active);
@@ -2603,6 +3148,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			if (biscuit_chain)
 				biscuit_dsp_set_volume(biscuit_chain,
 					speaker_volume_percent(sources, master));
+			(void)poll_owner_settings(root, &speaker);
 			(void)sendspin_stage(&g_sendspin);
 			render_period(sources, g_sendspin.stage,
 				      g_sendspin.stage_frames, output,
@@ -2664,7 +3210,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			SENDSPIN_TRACE("period");
 			process_music_visualizer(&visualizer, sources);
 			consume_period(sources);
+			airplay_delay_publish(pcm, sources);
 		}
+		g_output_start_due_ns = 0;
+		airplay_delay_publish(NULL, sources);
 		SENDSPIN_TRACE("close");
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
@@ -2691,6 +3240,7 @@ out:
 		le_audio_sink_destroy(g_sendspin.sink);
 		g_sendspin.sink = NULL;
 	}
+	le_ad_engine_close(&g_airplay_delay);
 	close_sources(sources);
 	return result;
 }
