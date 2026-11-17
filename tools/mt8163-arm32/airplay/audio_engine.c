@@ -2272,34 +2272,87 @@ static void select_speaker_profile(void)
 }
 
 /*
- * Owner bass/treble from <root>/tone.conf, read once per playback start.  A
- * missing or rejected file is flat, which is the stock sound.  The tone sits
- * on the mono bus before the chain's protection, so it cannot bypass MBCL.
+ * Owner settings files.  Both are read at playback start and watched while
+ * playing: every OWNER_SETTINGS_POLL_PERIODS periods (12 x 2048 frames, about
+ * 0.5 s) the engine stats them, and re-reads only a file whose stat changed.
+ * A changed setting is crossfaded in over one period by the chains.
+ * owner_settings.reads counts file reads (host tests check it stays put).
+ */
+#define OWNER_SETTINGS_POLL_PERIODS 12U
+
+struct owner_file_key {
+	int present;
+	dev_t dev;
+	ino_t ino;
+	off_t size;
+	struct timespec mtime, ctime;
+};
+
+static struct {
+	unsigned int periods;
+	struct owner_file_key tone, boost;
+	unsigned long reads;
+} owner_settings;
+
+static void owner_file_key_get(const char *root, const char *name,
+			       struct owner_file_key *key)
+{
+	char path[256];
+	struct stat st;
+	int n;
+
+	memset(key, 0, sizeof(*key));
+	n = snprintf(path, sizeof(path), "%s/%s", root, name);
+	if (n < 0 || n >= (int)sizeof(path) || lstat(path, &st) != 0)
+		return;
+	key->present = 1;
+	key->dev = st.st_dev;
+	key->ino = st.st_ino;
+	key->size = st.st_size;
+	key->mtime = st.st_mtim;
+	key->ctime = st.st_ctim;
+}
+
+static int owner_file_key_same(const struct owner_file_key *a,
+			       const struct owner_file_key *b)
+{
+	if (!a->present || !b->present)
+		return a->present == b->present;
+	return a->dev == b->dev && a->ino == b->ino && a->size == b->size &&
+	       a->mtime.tv_sec == b->mtime.tv_sec &&
+	       a->mtime.tv_nsec == b->mtime.tv_nsec &&
+	       a->ctime.tv_sec == b->ctime.tv_sec &&
+	       a->ctime.tv_nsec == b->ctime.tv_nsec;
+}
+
+/*
+ * Owner equaliser from <root>/tone.conf (schema 1 or 2, speaker_tone.h).  A
+ * missing or rejected file is flat, which is the stock sound.  The bands sit
+ * on the mono bus before the chain's protection, so they cannot bypass MBCL.
  */
 static void load_owner_tone(const char *root, struct speaker_tone *out)
 {
-	char path[256], text[128];
+	char path[256], text[192];
 	int n, rc;
 
-	out->bass_db = 0.0f;
-	out->treble_db = 0.0f;
+	speaker_tone_flat(out);
 	n = snprintf(path, sizeof(path), "%s/%s", root, TONE_SETTINGS_FILE);
 	if (n < 0 || n >= (int)sizeof(path))
 		return;
+	++owner_settings.reads;
 	rc = read_small_file(path, text, sizeof(text));
 	if (rc < 0)
 		return;
 	if (rc == 0 || !speaker_tone_parse(text, out)) {
 		fprintf(stderr, "audio-engine: tone settings rejected; using flat\n");
-		out->bass_db = 0.0f;
-		out->treble_db = 0.0f;
+		speaker_tone_flat(out);
 	}
 }
 
 /*
- * Owner gain boost from <root>/boost.conf, read once per playback start.  A
- * missing or rejected file is 0 dB, which is the stock sound.  The makeup is
- * applied ahead of the chain's protection, so it cannot bypass it.
+ * Owner gain boost from <root>/boost.conf.  A missing or rejected file is
+ * 0 dB, which is the stock sound.  The makeup is applied ahead of the chain's
+ * protection, so it cannot bypass it.
  */
 static void load_owner_boost(const char *root, float *out_db)
 {
@@ -2310,6 +2363,7 @@ static void load_owner_boost(const char *root, float *out_db)
 	n = snprintf(path, sizeof(path), "%s/%s", root, BOOST_SETTINGS_FILE);
 	if (n < 0 || n >= (int)sizeof(path))
 		return;
+	++owner_settings.reads;
 	rc = read_small_file(path, text, sizeof(text));
 	if (rc < 0)
 		return;
@@ -2317,6 +2371,84 @@ static void load_owner_boost(const char *root, float *out_db)
 		fprintf(stderr, "audio-engine: boost settings rejected; using 0 dB\n");
 		*out_db = 0.0f;
 	}
+}
+
+static void log_owner_tone(const struct speaker_tone *t, const char *when)
+{
+	fprintf(stderr, "audio-engine: owner tone%s bass %+.1f low-mid %+.1f "
+		"high-mid %+.1f treble %+.1f dB\n", when, (double)t->bass_db,
+		(double)t->low_mid_db, (double)t->high_mid_db, (double)t->treble_db);
+}
+
+/* Playback start: read both files and apply them at once (no history yet). */
+static void apply_owner_settings(const char *root, struct speaker_dsp *speaker)
+{
+	struct speaker_tone tone;
+	float boost_db;
+
+	/* Stat before reading: a write racing the read is seen by the next poll. */
+	owner_file_key_get(root, TONE_SETTINGS_FILE, &owner_settings.tone);
+	owner_file_key_get(root, BOOST_SETTINGS_FILE, &owner_settings.boost);
+	owner_settings.periods = 0;
+	load_owner_tone(root, &tone);
+	load_owner_boost(root, &boost_db);
+	speaker_dsp_set_tone(speaker, tone.bass_db, tone.low_mid_db,
+			     tone.high_mid_db, tone.treble_db);
+	speaker_dsp_set_boost(speaker, boost_db);
+	if (biscuit_chain) {
+		biscuit_dsp_set_tone(biscuit_chain, tone.bass_db, tone.low_mid_db,
+				     tone.high_mid_db, tone.treble_db);
+		biscuit_dsp_set_boost(biscuit_chain, boost_db);
+	}
+	if (!speaker_tone_is_flat(&tone))
+		log_owner_tone(&tone, "");
+	if (boost_db != 0.0f)
+		fprintf(stderr, "audio-engine: owner boost %+.1f dB\n", (double)boost_db);
+}
+
+/*
+ * While playing, once per period: every OWNER_SETTINGS_POLL_PERIODS periods
+ * stat both files and re-read only a changed one.  The chains crossfade the
+ * new equaliser and ramp the new boost over one period.  A file removed after
+ * a change is flat / 0 dB.  Returns 1 when a setting was re-read.
+ */
+static int poll_owner_settings(const char *root, struct speaker_dsp *speaker)
+{
+	struct owner_file_key key;
+	int reread = 0;
+
+	if (++owner_settings.periods < OWNER_SETTINGS_POLL_PERIODS)
+		return 0;
+	owner_settings.periods = 0;
+	owner_file_key_get(root, TONE_SETTINGS_FILE, &key);
+	if (!owner_file_key_same(&key, &owner_settings.tone)) {
+		struct speaker_tone tone;
+
+		owner_settings.tone = key;
+		load_owner_tone(root, &tone);
+		speaker_dsp_fade_tone(speaker, tone.bass_db, tone.low_mid_db,
+				      tone.high_mid_db, tone.treble_db);
+		if (biscuit_chain)
+			biscuit_dsp_fade_tone(biscuit_chain, tone.bass_db,
+					      tone.low_mid_db, tone.high_mid_db,
+					      tone.treble_db);
+		log_owner_tone(&tone, " changed:");
+		reread = 1;
+	}
+	owner_file_key_get(root, BOOST_SETTINGS_FILE, &key);
+	if (!owner_file_key_same(&key, &owner_settings.boost)) {
+		float boost_db;
+
+		owner_settings.boost = key;
+		load_owner_boost(root, &boost_db);
+		speaker_dsp_fade_boost(speaker, boost_db);
+		if (biscuit_chain)
+			biscuit_dsp_fade_boost(biscuit_chain, boost_db);
+		fprintf(stderr, "audio-engine: owner boost changed: %+.1f dB\n",
+			(double)boost_db);
+		reread = 1;
+	}
+	return reread;
 }
 
 /*
@@ -2554,8 +2686,6 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 				  int master_volume, int32_t *master_gain)
 {
 	int ready = wait_for_period(sources, root);
-	struct speaker_tone tone;
-	float boost_db;
 
 	if (ready <= 0)
 		return ready;
@@ -2572,23 +2702,13 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 			return 2;
 	}
 	puffin_dynamics_init(dynamics);
-	load_owner_tone(root, &tone);
-	load_owner_boost(root, &boost_db);
 	speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));
-	speaker_dsp_set_tone(speaker, tone.bass_db, tone.treble_db);
-	speaker_dsp_set_boost(speaker, boost_db);
 	if (biscuit_chain) {
 		biscuit_dsp_init(biscuit_chain,
 			speaker_volume_percent(sources, master_volume));
 		biscuit_dsp_configure(biscuit_chain, speaker_profile.bass_makeup_db);
-		biscuit_dsp_set_tone(biscuit_chain, tone.bass_db, tone.treble_db);
-		biscuit_dsp_set_boost(biscuit_chain, boost_db);
 	}
-	if (tone.bass_db != 0.0f || tone.treble_db != 0.0f)
-		fprintf(stderr, "audio-engine: owner tone bass %+.1f dB treble %+.1f dB\n",
-			(double)tone.bass_db, (double)tone.treble_db);
-	if (boost_db != 0.0f)
-		fprintf(stderr, "audio-engine: owner boost %+.1f dB\n", (double)boost_db);
+	apply_owner_settings(root, speaker);
 	*master_gain = logical_master_gain(master_volume);
 	(void)sendspin_stage(&g_sendspin);
 	render_period(sources, g_sendspin.stage, g_sendspin.stage_frames, output,
@@ -3028,6 +3148,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			if (biscuit_chain)
 				biscuit_dsp_set_volume(biscuit_chain,
 					speaker_volume_percent(sources, master));
+			(void)poll_owner_settings(root, &speaker);
 			(void)sendspin_stage(&g_sendspin);
 			render_period(sources, g_sendspin.stage,
 				      g_sendspin.stage_frames, output,
