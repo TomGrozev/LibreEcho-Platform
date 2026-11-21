@@ -102,6 +102,44 @@ def simple_dts(index: int) -> str:
 '''
 
 
+WIFI_VENDOR_SPEC = (HERE.parent / 'mt8163-arm32' / 'initramfs' /
+                    'vendor-assets' / 'lidar-mt7668-stock-v1.tsv')
+# The redistributable linux-firmware MT7668 patch is fixed at 170990 bytes and
+# one SHA-256.  The contract under test is the staged layout and inventory, not
+# the vendor payload, so the fixture is the same size and each test pins its
+# own digest for the duration of the test.
+WIFI_PATCH_PUBLISHED_SIZE = 170990
+WIFI_PATCH_PUBLISHED_SHA256 = (
+    '465ed634c61b46b34bb21240736f33d3d347fefec7cbfbd1cb6e63334aec4cc9'
+)
+WIFI_LICENCE_FIXTURE = b'MT7668 firmware licence fixture\n'
+
+
+def synthetic_wifi_patch() -> bytes:
+    block = b'MT7668 synthetic firmware fixture\n'
+    repeats = WIFI_PATCH_PUBLISHED_SIZE // len(block) + 1
+    return (block * repeats)[:WIFI_PATCH_PUBLISHED_SIZE]
+
+
+def wifi_patch_bytes() -> bytes:
+    return synthetic_wifi_patch()
+
+
+def wifi_licence_bytes() -> bytes:
+    return WIFI_LICENCE_FIXTURE
+
+
+def wifi_staging() -> dict[str, bytes]:
+    patch = wifi_patch_bytes()
+    return {
+        'lib/firmware/mediatek/mt7668pr2h.bin': patch,
+        'lib/firmware/mt7668_patch_e2_hdr.bin': patch,
+        'lib/firmware/LICENCE.mediatek': wifi_licence_bytes(),
+        'etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv':
+            WIFI_VENDOR_SPEC.read_bytes(),
+    }
+
+
 def make_elf32_arm() -> bytes:
     ident = bytearray(16)
     ident[:4] = b'\x7fELF'
@@ -149,7 +187,8 @@ def staged_overlay(directory: Path) -> tuple[list[tuple[str, int, bytes]],
                              'system', 'system/bin', 'tmp', 'usr', 'usr/local',
                              'usr/local/sbin', 'usr/local/libexec',
                              'etc/libreecho', 'etc/init.d',
-                             'etc/libreecho/vendor-assets'}
+                             'etc/libreecho/vendor-assets', 'lib/firmware',
+                             'lib/firmware/mediatek'}
 
     errored = False
     for key, staged in verifier.shared.OVERLAY_TARGETS.items():
@@ -189,6 +228,10 @@ def staged_overlay(directory: Path) -> tuple[list[tuple[str, int, bytes]],
                     b'a' * 64 + b'\n'))
     entries.append(('etc/libreecho/target', stat.S_IFREG | 0o644,
                     targets.identity_bytes('lidar')))
+    entries.append(('etc/libreecho/audio-profile', stat.S_IFREG | 0o644,
+                    targets.audio_profile_bytes('lidar')))
+    for relative, data in wifi_staging().items():
+        entries.append((relative, stat.S_IFREG | 0o644, data))
     for relative, text in (
         ('etc/libreecho/image-profile', 'development\n'),
         ('etc/libreecho/service-profile', 'diagnostic\n'),
@@ -314,12 +357,32 @@ def build_manifest(record: dict[str, object], ramdisk: bytes,
                    applets: list[str], elf_sha: str,
                    ota_key_sha: str) -> dict[str, object]:
     cpio = lzma.decompress(ramdisk, format=lzma.FORMAT_XZ)
+    profile = targets.audio_profile_bytes('lidar')
+    wifi = wifi_staging()
     return {
         'schema_version': 2,
         'name': 'libreecho-lidar-arm64-v1-recovery',
         'status': 'PREPARED_NOT_FLASHED',
         'board': 'lidar',
-        'audio_profile': None,
+        'audio_profile': {'sha256': builder.sha256(profile),
+                          'size': len(profile)},
+        'audio': {'enabled': True, 'path': '/etc/libreecho/audio-profile',
+                  'sha256': builder.sha256(profile), 'size': len(profile)},
+        'wifi_firmware': {
+            'patch': {'sha256': builder.WIFI_PATCH_SHA256,
+                      'size': builder.WIFI_PATCH_SIZE,
+                      'source': 'linux-firmware'},
+            'licence': {'sha256': builder.sha256(wifi['lib/firmware/LICENCE.mediatek']),
+                        'size': len(wifi['lib/firmware/LICENCE.mediatek'])},
+            'vendor_spec': {
+                'sha256': builder.sha256(
+                    wifi['etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv']),
+                'size': len(
+                    wifi['etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv'])},
+            'files': {relative: {'sha256': builder.sha256(data),
+                                 'size': len(data)}
+                      for relative, data in wifi.items()},
+        },
         'adbd': {'sha256': elf_sha, 'size': len(make_elf32_arm())},
         'ota': {
             'board': 'lidar',
@@ -577,15 +640,174 @@ class LidarImageTests(unittest.TestCase):
             self.verify(boot, manifest, ramdisk=ramdisk, expected_extra=expected)
         self.assertIn('hash mismatch', str(caught.exception))
 
-    def test_target_table_has_no_audio_profile(self):
+    def test_target_table_renders_the_lidar_audio_profile(self):
         record = targets.get_target('lidar')
-        self.assertIsNone(record['audio'])
-        self.assertIsNone(targets.audio_profile_bytes('lidar'))
         self.assertEqual(record['soc'], 'mt8167')
         self.assertEqual(record['userspace_architecture'], 'armv7')
         self.assertEqual(len(record['partitions']), 16)
         self.assertEqual(targets.partition_device('lidar', 'boot_a'),
                          '/dev/mmcblk0p10')
+        profile = targets.audio_profile_bytes('lidar').decode()
+        self.assertTrue(profile.startswith('schema=1\ntarget_id=lidar\n'))
+        lines = profile.splitlines()
+        self.assertEqual(lines.count('schema=1'), 1)
+        self.assertIn('speaker_chain=lidar', lines)
+        self.assertIn('codec_profile=Flat', lines)
+        self.assertIn('pre_gain_db=0', lines)
+        self.assertIn('playback_format=s16_le', lines)
+        self.assertIn('capture_channels=8', lines)
+        self.assertIn('capture_format=s32_le', lines)
+        self.assertIn('capture_roles=mic0,mic1,mic2,mic3,mic4,mic5,mic6,line-in',
+                      lines)
+        self.assertIn('aec_source=separate-pcm', lines)
+        self.assertIn('aec_device=2', lines)
+        self.assertEqual([line.split('=', 1)[0] for line in lines[2:]],
+                         list(targets.AUDIO_KEYS))
+        with self.assertRaises(ValueError):
+            targets.validate_audio({**record['audio'], 'speaker_chain': 'biscuit'})
+        with self.assertRaises(ValueError):
+            targets.validate_audio({**record['audio'], 'extra': 1})
+
+    def test_add_lidar_identity_writes_the_profile(self):
+        stage = self.directory / 'identity-stage'
+        stage.mkdir()
+        manifest: dict[str, object] = {}
+        builder.add_lidar_identity(stage, manifest, 'lidar', None)
+        profile = targets.audio_profile_bytes('lidar')
+        audio = stage / 'etc/libreecho/audio-profile'
+        self.assertEqual(audio.read_bytes(), profile)
+        self.assertEqual(stat.S_IMODE(audio.stat().st_mode), 0o644)
+        self.assertEqual(manifest['audio_profile'],
+                         {'sha256': builder.sha256(profile), 'size': len(profile)})
+        self.assertTrue(manifest['audio']['enabled'])
+
+    def test_add_lidar_wifi_firmware_stages_both_driver_names(self):
+        stage = self.directory / 'wifi-stage'
+        stage.mkdir()
+        patch_path = self.directory / 'mt7668pr2h.bin'
+        patch_path.write_bytes(synthetic_wifi_patch())
+        licence = self.directory / 'LICENCE.mediatek'
+        licence.write_bytes(wifi_licence_bytes())
+        manifest: dict[str, object] = {}
+        builder.add_lidar_wifi_firmware(
+            stage, manifest, patch_path, licence)
+        patch = wifi_patch_bytes()
+        for relative in ('lib/firmware/mediatek/mt7668pr2h.bin',
+                         'lib/firmware/mt7668_patch_e2_hdr.bin'):
+            member = stage / relative
+            self.assertEqual(member.read_bytes(), patch)
+            self.assertEqual(stat.S_IMODE(member.stat().st_mode), 0o644)
+        self.assertTrue((stage / 'lib/firmware/LICENCE.mediatek').is_file())
+        spec = stage / 'etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv'
+        self.assertEqual(spec.read_bytes(), WIFI_VENDOR_SPEC.read_bytes())
+        self.assertEqual(manifest['wifi_firmware']['patch']['sha256'],
+                         self.wifi_sha)
+        self.assertEqual(manifest['wifi_firmware']['patch']['size'],
+                         WIFI_PATCH_PUBLISHED_SIZE)
+        self.assertEqual(set(manifest['wifi_firmware']['files']),
+                         set(wifi_staging()))
+
+    def test_wifi_patch_pins_the_published_linux_firmware_blob(self):
+        # The per-test fixture substitutes only the digest; the image must
+        # otherwise stage the exact published linux-firmware blob.
+        self.assertEqual(builder.WIFI_PATCH_SIZE, WIFI_PATCH_PUBLISHED_SIZE)
+        self.assertEqual(verifier.WIFI_PATCH_SIZE, WIFI_PATCH_PUBLISHED_SIZE)
+        for module, digest in self.published_wifi.items():
+            self.assertEqual(digest, WIFI_PATCH_PUBLISHED_SHA256, module.__name__)
+        self.assertEqual(len(synthetic_wifi_patch()), builder.WIFI_PATCH_SIZE)
+
+    def test_add_lidar_wifi_firmware_rejects_an_unpinned_patch(self):
+        stage = self.directory / 'bad-wifi-stage'
+        stage.mkdir()
+        bad = self.directory / 'bad-patch.bin'
+        bad.write_bytes(b'not the linux-firmware patch')
+        licence = self.directory / 'bad-licence'
+        licence.write_bytes(b'licence\n')
+        with self.assertRaises(builder.BuildError):
+            builder.add_lidar_wifi_firmware(stage, {}, bad, licence)
+        self.assertEqual(list(stage.iterdir()), [])
+
+    def test_verifier_rejects_lidar_init_without_the_target_case(self):
+        # An intact target file can still sit beside a loader without the
+        # lidar case, so the slot boots without Wi-Fi.
+        original = (SIBLING_OVERLAY / 'libreecho-init').read_bytes()
+        broken = original.replace(b'        lidar) TARGET_SLUG=lidar ;;\n', b'')
+        self.assertNotEqual(broken, original)
+        entries, overlay, symlinks = staged_overlay(self.directory)
+        entries = [(name, mode, broken if name == 'init' else data)
+                   for name, mode, data in entries]
+        ramdisk = builder.compress_ramdisk(make_cpio(entries))
+        boot, record = builder.build_image(self.stock, self.kernel, self.dtb,
+                                           ramdisk)
+        manifest = build_manifest(record, ramdisk, symlinks, overlay,
+                                  self.applets, self.elf_sha, self.ota_key_sha)
+        manifest['output']['sha256'] = builder.sha256(boot)
+        with mock.patch.object(verifier, 'INIT_SHA256', builder.sha256(broken)):
+            with self.assertRaises(verifier.VerifyError) as caught:
+                self.verify(boot, manifest, ramdisk=ramdisk)
+        self.assertIn('image target parser does not map lidar: libreecho-init',
+                      str(caught.exception))
+
+    def test_verifier_rejects_lidar_init_without_the_wifi_radio_gate(self):
+        original = (SIBLING_OVERLAY / 'libreecho-init').read_bytes()
+        broken = original.replace(b'last_check=wifi-radio', b'last_check=wifi-radix')
+        self.assertNotEqual(broken, original)
+        entries, overlay, symlinks = staged_overlay(self.directory)
+        entries = [(name, mode, broken if name == 'init' else data)
+                   for name, mode, data in entries]
+        ramdisk = builder.compress_ramdisk(make_cpio(entries))
+        boot, record = builder.build_image(self.stock, self.kernel, self.dtb,
+                                           ramdisk)
+        manifest = build_manifest(record, ramdisk, symlinks, overlay,
+                                  self.applets, self.elf_sha, self.ota_key_sha)
+        manifest['output']['sha256'] = builder.sha256(boot)
+        with mock.patch.object(verifier, 'INIT_SHA256', builder.sha256(broken)):
+            with self.assertRaises(verifier.VerifyError) as caught:
+                self.verify(boot, manifest, ramdisk=ramdisk)
+        self.assertIn('Lidar wifi-radio health gate is missing', str(caught.exception))
+
+    def test_verifier_rejects_an_mt8163_wifi_member(self):
+        entries, overlay, symlinks = staged_overlay(self.directory)
+        entries.append(('lib/firmware/WIFI_RAM_CODE_8163',
+                        stat.S_IFREG | 0o644, b'mt8163-code'))
+        ramdisk = builder.compress_ramdisk(make_cpio(entries))
+        boot, record = builder.build_image(self.stock, self.kernel, self.dtb,
+                                           ramdisk)
+        manifest = build_manifest(record, ramdisk, symlinks, overlay,
+                                  self.applets, self.elf_sha, self.ota_key_sha)
+        manifest['output']['sha256'] = builder.sha256(boot)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.verify(boot, manifest, ramdisk=ramdisk)
+        self.assertIn('MT8163 Wi-Fi member', str(caught.exception))
+
+    def test_verifier_rejects_a_missing_audio_profile(self):
+        entries, overlay, symlinks = staged_overlay(self.directory)
+        entries = [entry for entry in entries
+                   if entry[0] != 'etc/libreecho/audio-profile']
+        ramdisk = builder.compress_ramdisk(make_cpio(entries))
+        boot, record = builder.build_image(self.stock, self.kernel, self.dtb,
+                                           ramdisk)
+        manifest = build_manifest(record, ramdisk, symlinks, overlay,
+                                  self.applets, self.elf_sha, self.ota_key_sha)
+        manifest['output']['sha256'] = builder.sha256(boot)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.verify(boot, manifest, ramdisk=ramdisk)
+        self.assertIn('audio-profile', str(caught.exception))
+
+    def test_verifier_rejects_a_tampered_wifi_patch(self):
+        entries, overlay, symlinks = staged_overlay(self.directory)
+        entries = [(name, mode, (bytes([data[0] ^ 0xFF]) + data[1:])
+                    if name == 'lib/firmware/mt7668_patch_e2_hdr.bin' else data)
+                   for name, mode, data in entries]
+        ramdisk = builder.compress_ramdisk(make_cpio(entries))
+        boot, record = builder.build_image(self.stock, self.kernel, self.dtb,
+                                           ramdisk)
+        manifest = build_manifest(record, ramdisk, symlinks, overlay,
+                                  self.applets, self.elf_sha, self.ota_key_sha)
+        manifest['output']['sha256'] = builder.sha256(boot)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.verify(boot, manifest, ramdisk=ramdisk)
+        self.assertIn('hash mismatch', str(caught.exception))
 
     def test_round_trip_passes_independent_verifier(self):
         boot, record, manifest = self.package()

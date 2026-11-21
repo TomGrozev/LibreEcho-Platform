@@ -24,12 +24,17 @@ with `uname`.
 | fastboot product | `LIDAR` |
 | SoC | `mt8167` |
 | userspace architecture | `armv7` |
-| audio | none |
+| audio | Flat codec, `lidar` chain |
 
 The table records all 16 GPT partitions from the live dump, including
-`misc` 1024 KiB at p8 and the absent recovery partition.  `audio` is `None`,
-so the builder writes no `/etc/libreecho/audio-profile`.  Audio has its
-and a guessed speaker policy would be worse than the engine's disabled state.
+`misc` 512 KiB at p8 and the absent recovery partition.
+
+The builder renders `/etc/libreecho/audio-profile` (schema 1) from the target
+table: flat codec, zero analogue and digital gain, stereo 48 kHz `s16_le`
+playback, the 8-channel 16 kHz `s32_le` capture array
+(`mic0..mic6,line-in`), and a separate stereo 48 kHz `s16_le` AEC PCM.  The UI
+and the audio engine read the same file, and `wake word`/`agentd` stay enabled
+because an audio profile is present.
 
 The shared `init.rc` imports `/init.recovery.${ro.hardware}.rc`, so the overlay
 keeps `ro.hardware=mt8163`; this is a userspace file-selection name, not a
@@ -93,6 +98,8 @@ python3 tools/mt8167-arm64/build_recovery_image.py \
   --bootctl <static-arm32-libreecho-bootctl> \
   --update-verifier <static-arm32-libreecho-update-verify> \
   --ota-public-key <ota-public-key.hex> \
+  --wifi-patch <mt7668pr2h.bin> \
+  --wifi-licence <LICENCE.mediatek> \
   --qemu-arm <qemu-arm-static> \
   --output <out>/boot-lidar-recovery.img
 ```
@@ -117,6 +124,16 @@ Optional flags:
 The builder refuses to overwrite an existing output, ramdisk or manifest.
 `--audio-probe`, `--wifi-dtb` and `--connectivity-bundle` are refused with an
 explicit error because they are MT8163 payloads.
+
+`--wifi-patch` and `--wifi-licence` are required.  The patch must be the
+170990-byte linux-firmware `mt7668pr2h.bin`
+(`465ed634...aec4cc9`).  The builder stages the same bytes as
+`lib/firmware/mediatek/mt7668pr2h.bin` for the WLAN driver and
+`lib/firmware/mt7668_patch_e2_hdr.bin` for `btmtksdio`, plus
+`lib/firmware/LICENCE.mediatek` and the shipped
+`etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv`, and records them in
+`manifest['wifi_firmware']`.  The RAM codes and per-unit calibration come from
+the owner's `system_a` at boot; they are never baked into the image.
 
 UI and discovery inputs follow the shared MT8163 contract:
 

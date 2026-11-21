@@ -93,6 +93,16 @@ FORBIDDEN_CMDLINE = b'lidar.autoreboot'
 MAX_DTB_SIZE = 0x80000
 RAMDISK_COMPRESSION = 'xz-crc32-lzma2-8m'
 INIT_SHA256 = shared.INIT_SHA256
+WIFI_PATCH_SHA256 = (
+    '465ed634c61b46b34bb21240736f33d3d347fefec7cbfbd1cb6e63334aec4cc9'
+)
+WIFI_PATCH_SIZE = 170990
+WIFI_VENDOR_SPEC = SIBLING / 'initramfs/vendor-assets/lidar-mt7668-stock-v1.tsv'
+WIFI_FORBIDDEN_MEMBERS = (
+    'lib/firmware/WIFI_RAM_CODE',
+    'lib/firmware/WIFI_RAM_CODE_8163',
+    'lib/firmware/WMT_SOC.cfg',
+)
 
 
 class VerifyError(RuntimeError):
@@ -101,6 +111,15 @@ class VerifyError(RuntimeError):
 
 def fail(message: str) -> None:
     raise VerifyError(message)
+
+
+def require_member(entries: dict[str, Any], name: str, digest: str,
+                   mode: int):
+    """The shared helper signals with SystemExit; keep one exception type."""
+    try:
+        return shared.require_member(entries, name, digest, mode)
+    except SystemExit as exc:
+        raise VerifyError(str(exc)) from exc
 
 
 def sha256(data: bytes) -> str:
@@ -406,10 +425,57 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, Any], target: str,
                           sha256(targets.identity_bytes(target, digest)), 0o644)
     if manifest.get('board') != target or ota.get('board') != target:
         fail('image target manifest mismatch')
-    if manifest.get('audio_profile') is not None:
-        fail('manifest claims an audio profile for a target without audio')
-    if 'etc/libreecho/audio-profile' in entries:
-        fail('target lidar must not carry /etc/libreecho/audio-profile')
+    profile = targets.audio_profile_bytes(target)
+    audio_record = manifest.get('audio_profile')
+    if (not isinstance(audio_record, dict)
+            or audio_record.get('sha256') != sha256(profile)
+            or audio_record.get('size') != len(profile)):
+        fail('manifest audio profile differs from the target renderer')
+    audio_entry = require_member(
+        entries, 'etc/libreecho/audio-profile', sha256(profile), 0o644)
+    if audio_entry.data != profile:
+        fail('audio profile differs from the target renderer')
+    audio_manifest = manifest.get('audio')
+    if not isinstance(audio_manifest, dict) or audio_manifest.get('enabled') is not True:
+        fail('manifest does not enable the staged audio profile')
+
+    wifi = manifest.get('wifi_firmware')
+    if not isinstance(wifi, dict) or not isinstance(wifi.get('files'), dict):
+        fail('manifest lacks the Wi-Fi firmware records')
+    patch = wifi.get('patch')
+    if (not isinstance(patch, dict)
+            or patch.get('sha256') != WIFI_PATCH_SHA256
+            or patch.get('size') != WIFI_PATCH_SIZE):
+        fail('manifest does not pin the linux-firmware MT7668 patch')
+    spec = read(WIFI_VENDOR_SPEC)
+    expected_files = {
+        'lib/firmware/mediatek/mt7668pr2h.bin': WIFI_PATCH_SHA256,
+        'lib/firmware/mt7668_patch_e2_hdr.bin': WIFI_PATCH_SHA256,
+        'lib/firmware/LICENCE.mediatek': None,
+        'etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv': sha256(spec),
+    }
+    for relative, digest in expected_files.items():
+        record = wifi['files'].get(relative)
+        if not isinstance(record, dict):
+            fail(f'manifest lacks the Wi-Fi record for {relative}')
+        if digest is not None and record.get('sha256') != digest:
+            fail(f'Wi-Fi member {relative} differs from the pinned bytes')
+        member = require_member(
+            entries, relative, str(record.get('sha256')), 0o644)
+        if record.get('size') != len(member.data):
+            fail(f'Wi-Fi member {relative} size differs from the manifest')
+        if relative.endswith('mt7668pr2h.bin') or \
+                relative.endswith('mt7668_patch_e2_hdr.bin'):
+            if len(member.data) != WIFI_PATCH_SIZE or \
+                    sha256(member.data) != WIFI_PATCH_SHA256:
+                fail(f'Wi-Fi patch member {relative} is not the pinned blob')
+        if relative.endswith('LICENCE.mediatek') and not member.data:
+            fail('Wi-Fi licence member is empty')
+    for name in entries:
+        base = name.rsplit('/', 1)[-1]
+        if name in WIFI_FORBIDDEN_MEMBERS or (
+                name.startswith('lib/firmware/') and base.startswith('ROMv2_')):
+            fail(f'MT8163 Wi-Fi member in a Lidar image: {name}')
 
     validate_thread(entries, manifest)
 

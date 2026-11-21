@@ -44,6 +44,24 @@ PARTITIONS = (
 BCB_OFFSET = 0x360
 BCB_RECORD_SIZE = 7
 
+# The Lidar speaker and microphone policy.  Schema 1 stays key=value; the
+# audio engine and the UI read the same file.  Key order is presentation only,
+# but it is kept in the order the engine documents so diffs stay readable.
+AUDIO_CHAINS = ('lidar',)
+CODEC_PROFILES = ('Flat',)
+PCM_FORMATS = ('s16_le', 's24_3le', 's32_le')
+CAPTURE_ROLES = ('mic0', 'mic1', 'mic2', 'mic3', 'mic4', 'mic5', 'mic6',
+                 'line-in')
+AUDIO_KEYS = (
+    'speaker_chain', 'codec_profile', 'hp_driver_gain', 'lo_driver_gain',
+    'pre_gain_db', 'bass_makeup_db',
+    'playback_card', 'playback_device', 'playback_rate', 'playback_channels',
+    'playback_format',
+    'capture_card', 'capture_device', 'capture_rate', 'capture_channels',
+    'capture_format', 'capture_roles', 'capture_chain',
+    'aec_source', 'aec_card', 'aec_device', 'aec_rate', 'aec_channels',
+    'aec_format',
+)
 TARGETS = {
     'lidar': {
         'release_slug': 'lidar',
@@ -52,11 +70,24 @@ TARGETS = {
         'dtb_verifier': 'lidar',
         'soc': 'mt8167',
         'userspace_architecture': 'armv7',
-        # Amazon shipped no Lidar audio profile.  A
-        # target with audio=None renders no /etc/libreecho/audio-profile, so
-        # the audio engine keeps its disabled state instead of reading a
-        # guessed speaker policy.
-        'audio': None,
+        # Flat codec, no analogue or digital gain: the MT8167 codec drives the
+        # speaker directly.  Playback is the stereo speaker PCM; capture is the
+        # 8-channel DMIC array; AEC is a separate stereo PCM.
+        'audio': {
+            'speaker_chain': 'lidar', 'codec_profile': 'Flat',
+            'hp_driver_gain': 0, 'lo_driver_gain': 0,
+            'pre_gain_db': 0, 'bass_makeup_db': 0,
+            'playback_card': 0, 'playback_device': 0,
+            'playback_rate': 48000, 'playback_channels': 2,
+            'playback_format': 's16_le',
+            'capture_card': 0, 'capture_device': 1,
+            'capture_rate': 16000, 'capture_channels': 8,
+            'capture_format': 's32_le',
+            'capture_roles': 'mic0,mic1,mic2,mic3,mic4,mic5,mic6,line-in',
+            'capture_chain': 'lidar',
+            'aec_source': 'separate-pcm', 'aec_card': 0, 'aec_device': 2,
+            'aec_rate': 48000, 'aec_channels': 2, 'aec_format': 's16_le',
+        },
         'partitions': PARTITIONS,
         'storage_sector_size': STORAGE_SECTOR_SIZE,
         'bcb': {'partition': 'misc', 'device': '/dev/mmcblk0p8',
@@ -65,16 +96,58 @@ TARGETS = {
 }
 
 
+def _integer(audio: dict, key: str, low: int, high: int | None = None) -> int:
+    value = audio[key]
+    if not isinstance(value, int) or isinstance(value, bool) or value < low:
+        raise ValueError(f'{key} must be an integer >= {low}')
+    if high is not None and value > high:
+        raise ValueError(f'{key} must be an integer <= {high}')
+    return value
+
+
 def validate_audio(audio: dict) -> dict:
-    raise ValueError('the Lidar target table does not define audio profiles')
+    if set(audio) != set(AUDIO_KEYS):
+        raise ValueError(f'audio profile keys must be exactly {AUDIO_KEYS}')
+    if audio['speaker_chain'] not in AUDIO_CHAINS:
+        raise ValueError(f'unknown speaker_chain: {audio["speaker_chain"]!r}')
+    if audio['codec_profile'] not in CODEC_PROFILES:
+        raise ValueError(f'unknown codec_profile: {audio["codec_profile"]!r}')
+    _integer(audio, 'hp_driver_gain', 0, 35)
+    _integer(audio, 'lo_driver_gain', 0, 35)
+    for key, high in (('pre_gain_db', 12.0), ('bass_makeup_db', 6.0)):
+        value = audio[key]
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not 0 <= value <= high):
+            raise ValueError(f'{key} must be within 0..{high} dB')
+    for prefix in ('playback', 'capture', 'aec'):
+        _integer(audio, prefix + '_card', 0)
+        _integer(audio, prefix + '_device', 0)
+        _integer(audio, prefix + '_rate', 1)
+        _integer(audio, prefix + '_channels', 1, 8)
+        if audio[prefix + '_format'] not in PCM_FORMATS:
+            raise ValueError(
+                f'unknown {prefix}_format: {audio[prefix + "_format"]!r}')
+    if audio['capture_chain'] not in AUDIO_CHAINS:
+        raise ValueError(
+            f'unknown capture_chain: {audio["capture_chain"]!r}')
+    if audio['aec_source'] != 'separate-pcm':
+        raise ValueError(f'unknown aec_source: {audio["aec_source"]!r}')
+    roles = audio['capture_roles']
+    role_list = roles.split(',') if isinstance(roles, str) else []
+    if (not role_list or len(set(role_list)) != len(role_list)
+            or any(role not in CAPTURE_ROLES for role in role_list)):
+        raise ValueError('capture_roles must be unique known roles')
+    return audio
 
 
-def audio_profile_bytes(target: str) -> bytes | None:
-    """Return the rendered speaker policy, or None when the target has none."""
-    record = get_target(target)
-    if record['audio'] is None:
-        return None
-    raise ValueError(f'target {target!r} has no renderer in this profile')
+def audio_profile_bytes(target: str) -> bytes:
+    """Deterministic key=value rendering consumed by the audio engine."""
+    audio = validate_audio(get_target(target)['audio'])
+    text = 'schema=1\n' + f'target_id={target}\n'
+    for key in AUDIO_KEYS:
+        value = audio[key]
+        text += f'{key}={value:.2f}\n' if isinstance(value, float) else f'{key}={value}\n'
+    return text.encode('ascii')
 
 
 def get_target(target: str) -> dict:

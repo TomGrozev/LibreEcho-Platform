@@ -107,6 +107,13 @@ PROVEN_STOCK_CMDLINE = (
 FORBIDDEN_CMDLINE = b'lidar.autoreboot'
 MAX_DTB_SIZE = 0x80000
 RAMDISK_COMPRESSION = 'xz-crc32-lzma2-8m'
+# The redistributable linux-firmware MT7668 ROM patch.  Both drivers request
+# the same bytes, one under the MediaTek directory and btmtksdio at the top.
+WIFI_PATCH_SHA256 = (
+    '465ed634c61b46b34bb21240736f33d3d347fefec7cbfbd1cb6e63334aec4cc9'
+)
+WIFI_PATCH_SIZE = 170990
+WIFI_VENDOR_SPEC = SIBLING / 'initramfs/vendor-assets/lidar-mt7668-stock-v1.tsv'
 
 
 class BuildError(RuntimeError):
@@ -509,11 +516,13 @@ def add_lidar_identity(stage: Path, manifest: dict[str, object], target: str,
     profile = targets.audio_profile_bytes(target)
     manifest['board'] = target
     manifest['audio_profile'] = None
-    if profile is not None:
-        audio = stage / 'etc/libreecho/audio-profile'
-        audio.write_bytes(profile)
-        audio.chmod(0o644)
-        manifest['audio_profile'] = {'sha256': sha256(profile), 'size': len(profile)}
+    audio = stage / 'etc/libreecho/audio-profile'
+    audio.write_bytes(profile)
+    audio.chmod(0o644)
+    record = {'sha256': sha256(profile), 'size': len(profile)}
+    manifest['audio_profile'] = record
+    manifest['audio'] = {'enabled': True, 'path': '/etc/libreecho/audio-profile',
+                         **record}
     if digest is not None:
         manifest['target_descriptor_sha256'] = digest
     props = stage / 'default.prop'
@@ -525,6 +534,44 @@ def add_lidar_identity(stage: Path, manifest: dict[str, object], target: str,
         if isinstance(overlay, dict):
             overlay['default.prop'] = {'sha256': sha256(data), 'size': len(data),
                                        'mode': '0644'}
+
+
+def add_lidar_wifi_firmware(stage: Path, manifest: dict[str, object],
+                            patch_source: Path, licence_source: Path) -> None:
+    """Stage the redistributable MT7668 patch both drivers ask for.
+
+    The RAM codes and the per-unit calibration come from the owner's stock
+    system_a through the boot importer; they are never baked into the image.
+    """
+    patch = read(patch_source)
+    if len(patch) != WIFI_PATCH_SIZE or sha256(patch) != WIFI_PATCH_SHA256:
+        raise BuildError(f'{patch_source} is not the pinned linux-firmware '
+                         f'MT7668 patch ({WIFI_PATCH_SIZE} bytes, '
+                         f'{WIFI_PATCH_SHA256})')
+    licence = read(licence_source)
+    if not licence:
+        raise BuildError(f'{licence_source} is empty')
+    spec = read(WIFI_VENDOR_SPEC)
+    files = (
+        ('lib/firmware/mediatek/mt7668pr2h.bin', patch),
+        ('lib/firmware/mt7668_patch_e2_hdr.bin', patch),
+        ('lib/firmware/LICENCE.mediatek', licence),
+        ('etc/libreecho/vendor-assets/lidar-mt7668-stock-v1.tsv', spec),
+    )
+    records: dict[str, object] = {}
+    for relative, data in files:
+        destination = stage / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        destination.chmod(0o644)
+        records[relative] = {'sha256': sha256(data), 'size': len(data)}
+    manifest['wifi_firmware'] = {
+        'patch': {'sha256': WIFI_PATCH_SHA256, 'size': WIFI_PATCH_SIZE,
+                  'source': 'linux-firmware'},
+        'licence': {'sha256': sha256(licence), 'size': len(licence)},
+        'vendor_spec': {'sha256': sha256(spec), 'size': len(spec)},
+        'files': records,
+    }
 
 
 def add_lidar_ota_tools(stage: Path, bootctl: Path, verifier: Path,
@@ -687,6 +734,10 @@ def main() -> None:
     parser.add_argument('--bootctl', type=Path, required=True)
     parser.add_argument('--update-verifier', type=Path, required=True)
     parser.add_argument('--ota-public-key', type=Path, required=True)
+    parser.add_argument('--wifi-patch', type=Path, required=True,
+                        help='linux-firmware mediatek/mt7668pr2h.bin')
+    parser.add_argument('--wifi-licence', type=Path, required=True,
+                        help='linux-firmware LICENCE.mediatek')
     parser.add_argument('--ui-bundle', type=Path,
                         help='staged static ARM32 LibreEcho-UI bundle')
     parser.add_argument('--mdns-runtime', type=Path,
@@ -796,6 +847,8 @@ def main() -> None:
                             args.service_profile, args.feature_policy,
                             args.update_channel, manifest, args.target,
                             args.target_descriptor_sha256)
+        add_lidar_wifi_firmware(stage, manifest, args.wifi_patch.resolve(),
+                                args.wifi_licence.resolve())
         if ui_enabled:
             shared.add_ui_bundle(
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),
