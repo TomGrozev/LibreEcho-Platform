@@ -96,6 +96,7 @@ def main() -> None:
             raise SystemExit(f"speaker tuning module is missing {fragment}")
 
     check_biscuit_selection(text)
+    check_lidar_chain(text)
 
     print("audio_engine_contract: mono programme duplicated into stereo PCM 23 PASS")
     print("audio_engine_contract: speaker tuning runs before the trim/limiter PASS")
@@ -112,7 +113,40 @@ RADAR_PROFILE = ("schema=1\ntarget_id=radar_puffin\nspeaker_chain=radar_puffin\n
                  "codec_profile=Radar\nhp_driver_gain=6\npre_gain_db=0.00\nbass_makeup_db=0.00\n")
 DOT_PROFILE = ("schema=1\ntarget_id=biscuit\nspeaker_chain=biscuit\n"
                "codec_profile=Flat\nhp_driver_gain=6\npre_gain_db=6.00\nbass_makeup_db=2.50\n")
-RADAR_DEFAULT = "chain=0 flat=0 gain=6 pre=1.000 bass=0.00"
+RADAR_DEFAULT = ("chain=0 flat=0 gain=6 pre=1.000 bass=0.00 lidar=0 card=0 dev=23"
+                 " rate=48000 fmt=0")
+LIDAR_PROFILE = (
+    "schema=1\ntarget_id=lidar\nspeaker_chain=lidar\ncodec_profile=Flat\n"
+    "hp_driver_gain=6\npre_gain_db=0.00\nbass_makeup_db=0.00\nlo_driver_gain=6\n"
+    "playback_card=0\nplayback_device=0\nplayback_rate=48000\n"
+    "playback_channels=2\nplayback_format=s16_le\n")
+
+
+def check_lidar_chain(text: str) -> None:
+    """Lidar (Echo Plus 2nd gen) renders mono into the AIC32x4 PCM.
+
+    The crossover and mono mix live in the codec, so the userspace Radar and
+    Dot chains must both be bypassed and the line-out DAC driven through the
+    machine driver's Speaker route.
+    """
+    for fragment in (
+        "if (speaker_profile.lidar_chain)\n\t\t\t\ty = wide;",
+        "if (speaker_profile.lidar_chain) {\n\t\t\tif (mixed > 32767)",
+        'set_enum_control(mixer, "Output Route", "Speaker")',
+        'set_enum_control(mixer, "Output Route", "Line Out")',
+        'set_stereo_control(mixer, "LO DAC Playback Switch", 0)',
+        'set_stereo_control(mixer, "LO DAC Playback Switch", 1)',
+        'set_single_control(mixer, "DAC Mono Mix Switch", 1)',
+        'set_single_control(mixer, "LOL Output Mixer L_DAC Switch", 1)',
+        'set_single_control(mixer, "LOR Output Mixer R_DAC Switch", 1)',
+        'set_stereo_control(mixer, "LO Driver Gain Volume"',
+        "speaker_profile.lidar_chain && speaker_profile.playback_format == 0",
+        "card = (unsigned int)speaker_profile.playback_card;",
+        "config.rate = speaker_profile.playback_rate;",
+    ):
+        if fragment not in text:
+            raise SystemExit(f"missing Lidar audio contract: {fragment}")
+    print("audio_engine_contract: Lidar bypasses userspace DSP and drives AIC32x4 PASS")
 
 
 def check_biscuit_selection(text: str) -> None:
@@ -172,6 +206,7 @@ def check_biscuit_selection(text: str) -> None:
         + extract(text, "static int read_small_file(")
         + extract(text, "static int image_target_is_biscuit(")
         + extract(text, "static int parse_db(")
+        + extract(text, "static int parse_uint(")
         + extract(text, "static int load_audio_profile(")
         + extract(text, "static void select_speaker_profile(")
         + "int main(int argc, char **argv) { (void)argc;\n"
@@ -179,13 +214,18 @@ def check_biscuit_selection(text: str) -> None:
           " IMAGE_TARGET_FILE = argv[3]; IMAGE_TARGET_FILE_HOST = argv[4];\n"
           " select_speaker_profile();\n"
           " if ((biscuit_chain != NULL) != speaker_profile.biscuit_chain) return 2;\n"
-          " return printf(\"chain=%d flat=%d gain=%d pre=%.3f bass=%.2f\","
+          " return printf(\"chain=%d flat=%d gain=%d pre=%.3f bass=%.2f"
+          " lidar=%d card=%d dev=%d rate=%u fmt=%d\","
           " speaker_profile.biscuit_chain, speaker_profile.codec_flat,"
           " speaker_profile.hp_driver_gain, (double)speaker_profile.pre_gain,"
-          " (double)speaker_profile.bass_makeup_db) < 0; }\n"
+          " (double)speaker_profile.bass_makeup_db, speaker_profile.lidar_chain,"
+          " speaker_profile.playback_card, speaker_profile.playback_device,"
+          " speaker_profile.playback_rate, speaker_profile.playback_format) < 0; }\n"
     )
-    dot = "chain=1 flat=1 gain=6 pre=1.995 bass=2.50"
-    legacy_dot = "chain=1 flat=1 gain=6 pre=1.000 bass=0.00"
+    dot = ("chain=1 flat=1 gain=6 pre=1.995 bass=2.50 lidar=0 card=0 dev=23"
+           " rate=48000 fmt=0")
+    legacy_dot = ("chain=1 flat=1 gain=6 pre=1.000 bass=0.00 lidar=0 card=0 dev=23"
+                  " rate=48000 fmt=0")
     biscuit_id = "target_id=biscuit\nrelease_slug=biscuit\nhw_profile=biscuit@0\n"
     # (profile, host profile, target, host target) -> expected
     cases = {
@@ -218,7 +258,11 @@ def check_biscuit_selection(text: str) -> None:
         "new_model_flat_radar_chain": ((RADAR_PROFILE.replace("target_id=radar_puffin", "target_id=future")
                                         .replace("codec_profile=Radar", "codec_profile=Flat")
                                         .replace("gain=6", "gain=0"), None, None, None),
-                                       "chain=0 flat=1 gain=0 pre=1.000 bass=0.00"),
+                                       "chain=0 flat=1 gain=0 pre=1.000 bass=0.00"
+                                       " lidar=0 card=0 dev=23 rate=48000 fmt=0"),
+        "lidar": ((LIDAR_PROFILE, None, None, None),
+                  "chain=0 flat=1 gain=6 pre=1.000 bass=0.00 lidar=1 card=0 dev=0"
+                  " rate=48000 fmt=0"),
     }
     with tempfile.TemporaryDirectory(prefix="libreecho-audio-profile.") as work:
         work_path = Path(work)

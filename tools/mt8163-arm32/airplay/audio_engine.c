@@ -740,15 +740,25 @@ static int set_single_control(struct mixer *mixer, const char *name, int value)
  */
 struct speaker_profile {
 	int biscuit_chain;      /* 0 = radar_puffin chain, 1 = biscuit chain */
+	int lidar_chain;        /* AIC32x4: crossover lives in the DAC biquads */
 	int codec_flat;         /* kernel "Speaker Codec Profile": 0 Radar, 1 Flat */
 	int hp_driver_gain;     /* codec "HP Driver Gain Volume" index */
+	int lo_driver_gain;     /* codec "LO Driver Gain Volume" index */
 	float pre_gain;         /* linear, biscuit chain only */
 	float bass_makeup_db;   /* biscuit chain only */
+	int playback_card;
+	int playback_device;
+	unsigned int playback_rate;
+	unsigned int playback_channels;
+	int playback_format;    /* 0 S16_LE, 1 S24_3LE, 2 S32_LE */
 };
 
 static struct speaker_profile speaker_profile = {
-	.biscuit_chain = 0, .codec_flat = 0, .hp_driver_gain = 6,
+	.biscuit_chain = 0, .lidar_chain = 0, .codec_flat = 0,
+	.hp_driver_gain = 6, .lo_driver_gain = 6,
 	.pre_gain = 1.0f, .bass_makeup_db = 0.0f,
+	.playback_card = 0, .playback_device = 23,
+	.playback_rate = 48000U, .playback_channels = 2U, .playback_format = 0,
 };
 
 /*
@@ -770,6 +780,10 @@ static struct speaker_profile speaker_profile = {
 
 static int chain_output_latency_us(const struct speaker_profile *profile)
 {
+	/* The Lidar path has no software DSP, but its amplifier/BQ delay has not
+	 * been measured yet; -1 keeps Sendspin timing uncalibrated. */
+	if (profile->lidar_chain)
+		return -1;
 	return profile->biscuit_chain ? BISCUIT_OUTPUT_LATENCY_US
 				      : RADAR_PUFFIN_OUTPUT_LATENCY_US;
 }
@@ -785,6 +799,26 @@ static int arm_output_controls(unsigned int card)
     if (!mixer) {
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
+    }
+    if (speaker_profile.lidar_chain) {
+        /* Selecting Speaker runs the machine driver's crossover, mono mix
+         * and amplifier enable.  Keep the DAC muted until the first period
+         * is queued, so enabling the amplifier cannot pop. */
+        if (set_enum_control(mixer, "Output Route", "Speaker") < 0)
+            result = -1;
+        if (set_single_control(mixer, "DAC Mono Mix Switch", 1) < 0)
+            result = -1;
+        if (set_stereo_control(mixer, "LO DAC Playback Switch", 0) < 0)
+            result = -1;
+        if (set_single_control(mixer, "LOL Output Mixer L_DAC Switch", 1) < 0)
+            result = -1;
+        if (set_single_control(mixer, "LOR Output Mixer R_DAC Switch", 1) < 0)
+            result = -1;
+        if (set_stereo_control(mixer, "LO Driver Gain Volume",
+                               speaker_profile.lo_driver_gain) < 0)
+            result = -1;
+        mixer_close(mixer);
+        return result;
     }
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
@@ -843,6 +877,8 @@ static int power_output_controls(unsigned int card)
     struct mixer *mixer;
     int result = 0;
 
+    if (speaker_profile.lidar_chain)
+        return 0; /* Output Route at arm already enabled the amplifier */
     mixer = mixer_open(card);
     if (!mixer) {
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
@@ -869,6 +905,15 @@ static int unmute_output_controls(unsigned int card)
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
     }
+    if (speaker_profile.lidar_chain) {
+        /* AIC32x4 line-out switch, not the Radar MFP mute. */
+        if (set_stereo_control(mixer, "LO DAC Playback Switch", 1) < 0)
+            result = -1;
+        mixer_close(mixer);
+        if (result < 0)
+            fprintf(stderr, "audio-engine: output unmute control unavailable\n");
+        return result;
+    }
     if (set_enum_control(mixer, "MFP Gpio Mute", "Off") < 0)
         result = -1;
     mixer_close(mixer);
@@ -886,6 +931,18 @@ static int disable_output_controls(unsigned int card)
     if (!mixer) {
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
+    }
+    if (speaker_profile.lidar_chain) {
+        /* Mute the DAC, then move the machine driver off Speaker, which
+         * powers the amplifier down before the mux changes. */
+        if (set_stereo_control(mixer, "LO DAC Playback Switch", 0) < 0)
+            result = -1;
+        if (set_enum_control(mixer, "Output Route", "Line Out") < 0)
+            result = -1;
+        mixer_close(mixer);
+        if (result < 0)
+            fprintf(stderr, "audio-engine: output disable controls unavailable\n");
+        return result;
     }
     /* Mute before removing amplifier power to avoid a shutdown pop. */
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
@@ -2206,15 +2263,46 @@ static int parse_db(const char *text, float low, float high, float *out)
 	return 0;
 }
 
+static int parse_uint(const char *text, unsigned long max, unsigned long *out)
+{
+	char *end;
+	unsigned long value;
+
+	errno = 0;
+	value = strtoul(text, &end, 10);
+	if (errno || end == text || *end || value > max)
+		return -1;
+	*out = value;
+	return 0;
+}
+
 /* Returns 1 parsed, -1 missing, 0 present but rejected. */
 static int load_audio_profile(const char *path, struct speaker_profile *out)
 {
-	enum { K_SCHEMA, K_TARGET, K_CHAIN, K_CODEC, K_GAIN, K_PRE, K_BASS, K_N };
+	enum {
+		K_SCHEMA, K_TARGET, K_CHAIN, K_CODEC, K_GAIN, K_PRE, K_BASS,
+		K_LO_GAIN, K_PLAY_CARD, K_PLAY_DEV, K_PLAY_RATE, K_PLAY_CH,
+		K_PLAY_FMT, K_CAP_CARD, K_CAP_DEV, K_CAP_RATE, K_CAP_CH,
+		K_CAP_FMT, K_CAP_ROLES, K_CAP_CHAIN, K_AEC_SOURCE, K_AEC_CARD,
+		K_AEC_DEV, K_AEC_RATE, K_AEC_CH, K_AEC_FMT, K_AEC_ROLES,
+		K_N
+	};
+	/* The original seven keys are required; the layout keys are optional
+	 * and default to the MT8163 PCM. Capture keys are validated here so a
+	 * renderer bug is caught once, even though playback ignores them. */
 	static const char *const keys[K_N] = {
 		"schema", "target_id", "speaker_chain", "codec_profile",
 		"hp_driver_gain", "pre_gain_db", "bass_makeup_db",
+		"lo_driver_gain",
+		"playback_card", "playback_device", "playback_rate",
+		"playback_channels", "playback_format",
+		"capture_card", "capture_device", "capture_rate",
+		"capture_channels", "capture_format", "capture_roles",
+		"capture_chain", "aec_source", "aec_card", "aec_device",
+		"aec_rate", "aec_channels", "aec_format", "aec_roles",
 	};
-	char text[1024], *line, *save = NULL;
+	enum { K_REQUIRED = K_LO_GAIN };
+	char text[2048], *line, *save = NULL;
 	int seen[K_N] = { 0 }, k, rc = read_small_file(path, text, sizeof(text));
 	struct speaker_profile p = speaker_profile;
 	float pre_db = 0.0f;
@@ -2244,12 +2332,19 @@ static int load_audio_profile(const char *path, struct speaker_profile *out)
 				return 0;
 			break;
 		case K_CHAIN:
-			if (!strcmp(value, "biscuit"))
+			if (!strcmp(value, "biscuit")) {
 				p.biscuit_chain = 1;
-			else if (!strcmp(value, "radar_puffin"))
+				p.lidar_chain = 0;
+			} else if (!strcmp(value, "radar_puffin")) {
 				p.biscuit_chain = 0;
-			else
+				p.lidar_chain = 0;
+			} else if (!strcmp(value, "lidar")) {
+				p.biscuit_chain = 0;
+				p.lidar_chain = 1;
+				p.codec_flat = 1;
+			} else {
 				return 0;
+			}
 			break;
 		case K_CODEC:
 			if (!strcmp(value, "Flat"))
@@ -2274,9 +2369,82 @@ static int load_audio_profile(const char *path, struct speaker_profile *out)
 			if (parse_db(value, 0.0f, 6.0f, &p.bass_makeup_db))
 				return 0;
 			break;
+		case K_LO_GAIN:
+			errno = 0;
+			gain = strtol(value, &end, 10);
+			if (errno || end == value || *end || gain < 0 || gain > 35)
+				return 0;
+			p.lo_driver_gain = (int)gain;
+			break;
+		case K_PLAY_CARD:
+		case K_PLAY_DEV:
+		case K_CAP_CARD:
+		case K_CAP_DEV:
+		case K_AEC_CARD:
+		case K_AEC_DEV: {
+			unsigned long number;
+
+			if (parse_uint(value, 31, &number))
+				return 0;
+			if (k == K_PLAY_CARD)
+				p.playback_card = (int)number;
+			else if (k == K_PLAY_DEV)
+				p.playback_device = (int)number;
+			break;
+		}
+		case K_PLAY_RATE:
+		case K_CAP_RATE:
+		case K_AEC_RATE: {
+			unsigned long number;
+
+			if (parse_uint(value, 192000, &number) ||
+			    (number != 8000 && number != 16000 && number != 44100 &&
+			     number != 48000 && number != 96000 && number != 192000))
+				return 0;
+			if (k == K_PLAY_RATE)
+				p.playback_rate = (unsigned int)number;
+			break;
+		}
+		case K_PLAY_CH:
+		case K_CAP_CH:
+		case K_AEC_CH: {
+			unsigned long number;
+
+			if (parse_uint(value, 8, &number) || number < 1)
+				return 0;
+			if (k == K_PLAY_CH)
+				p.playback_channels = (unsigned int)number;
+			break;
+		}
+		case K_PLAY_FMT:
+		case K_CAP_FMT:
+		case K_AEC_FMT: {
+			int format;
+
+			if (!strcmp(value, "s16_le"))
+				format = 0;
+			else if (!strcmp(value, "s24_3le"))
+				format = 1;
+			else if (!strcmp(value, "s32_le"))
+				format = 2;
+			else
+				return 0;
+			if (k == K_PLAY_FMT)
+				p.playback_format = format;
+			break;
+		}
+		case K_CAP_ROLES:
+		case K_CAP_CHAIN:
+		case K_AEC_SOURCE:
+		case K_AEC_ROLES:
+			/* Mic-side policy; micd consumes it, the engine only checks
+			 * that the renderer emitted a value. */
+			if (!*value)
+				return 0;
+			break;
 		}
 	}
-	for (k = 0; k < K_N; ++k)
+	for (k = 0; k < K_REQUIRED; ++k)
 		if (!seen[k])
 			return 0;
 	/* Digital gains belong to the biscuit chain; Radar's chain is fixed. */
@@ -2582,7 +2750,9 @@ static void render_period(struct source_bus *sources,
 				wide += (float)reply *
 					((float)reply_current_q15 / 32768.0f);
 
-			if (biscuit_chain)
+			if (speaker_profile.lidar_chain)
+				y = wide; /* crossover, mono mix and amp in hardware */
+			else if (biscuit_chain)
 				y = biscuit_dsp_process(biscuit_chain,
 					wide * speaker_profile.pre_gain);
 			else
@@ -2605,7 +2775,13 @@ static void render_period(struct source_bus *sources,
 			mixed += (int32_t)(((int64_t)reply * reply_current_q15) >> 15);
 		/* All producer buses meet here: mono EQ, then multiband
 		 * protection, then the +3 dB trim and final PCM safety limiter. */
-		if (biscuit_chain) {
+		if (speaker_profile.lidar_chain) {
+			if (mixed > 32767)
+				mixed = 32767;
+			else if (mixed < -32767)
+				mixed = -32767;
+			rendered = (int16_t)mixed;
+		} else if (biscuit_chain) {
 			rendered = biscuit_render_s16(biscuit_chain, mixed);
 		} else {
 			mixed = speaker_dsp_process(speaker, mixed);
@@ -2849,6 +3025,10 @@ static struct pcm *open_output_pcm(unsigned int card, unsigned int device,
 	struct pcm *pcm;
 
 	wide_output = 0;
+	/* The Lidar profile names S16_LE explicitly; do not second-guess it
+	 * with the 24-bit path, whose DL1 byte placement differs. */
+	if (speaker_profile.lidar_chain && speaker_profile.playback_format == 0)
+		return pcm_open(card, device, OUTPUT_PCM_FLAGS, s16);
 	if (wide_supported != 0) {
 		wide.format = PCM_FORMAT_S32_LE;
 		wide.period_size = WIDE_PERIOD_SIZE;
@@ -3062,17 +3242,30 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	if (!output)
 		goto out;
 	select_speaker_profile();
+	card = (unsigned int)speaker_profile.playback_card;
+	device = (unsigned int)speaker_profile.playback_device;
+	config.rate = speaker_profile.playback_rate;
+	if (speaker_profile.playback_channels != OUTPUT_CHANNELS)
+		fprintf(stderr, "audio-engine: profile channels %u unsupported; "
+			"using stereo\n", speaker_profile.playback_channels);
 	fprintf(stderr, "audio-engine: speaker chain %s codec %s hp-gain %d "
-		"pre %.2f bass %+.1f dB\n",
-		biscuit_chain ? "biscuit" : "radar-puffin",
+		"lo-gain %d pre %.2f bass %+.1f dB\n",
+		speaker_profile.lidar_chain ? "lidar"
+			: biscuit_chain ? "biscuit" : "radar-puffin",
 		speaker_profile.codec_flat ? "Flat" : "Radar",
-		speaker_profile.hp_driver_gain,
+		speaker_profile.hp_driver_gain, speaker_profile.lo_driver_gain,
 		(double)speaker_profile.pre_gain,
 		(double)speaker_profile.bass_makeup_db);
-	fprintf(stderr,
-		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
-		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
-		root, card, device);
+	if (speaker_profile.lidar_chain)
+		fprintf(stderr,
+			"audio-engine: ready (root=%s, input=S16_LE/%u/stereo, "
+			"output=S16_LE/%u/duplicated-stereo, PCM %u,%u)\n",
+			root, config.rate, config.rate, card, device);
+	else
+		fprintf(stderr,
+			"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
+			"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
+			root, card, device);
 	if (snprintf(avl_disable_path, sizeof(avl_disable_path), "%s/avl.disabled",
 		     root) >= (int)sizeof(avl_disable_path))
 		avl_disable_path[0] = '\0';
@@ -3181,7 +3374,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			sendspin_close_timing(&g_sendspin);
 			memset(&timing_config, 0, sizeof(timing_config));
 			timing_config.pcm = pcm;
-			timing_config.rate = DEFAULT_RATE;
+			timing_config.rate = config.rate;
 			timing_config.buffer_frames = 0;
 			timing_config.clock = LE_AUDIO_TIMING_CLOCK_MONOTONIC;
 			timing_config.output_latency_us =
