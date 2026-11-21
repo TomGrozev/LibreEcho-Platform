@@ -474,7 +474,7 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         self.assertEqual(sleeps, 5)
 
 
-class RecoveryWorkerRadioPathTests(unittest.TestCase):
+class _WorkerHarness(unittest.TestCase):
     """Execute the boot-path Wi-Fi worker instead of matching source strings.
 
     A fresh device has no /data and no packaged client profile.  The worker
@@ -522,12 +522,41 @@ class RecoveryWorkerRadioPathTests(unittest.TestCase):
     def run_worker(self, *, recovery: bool, packaged_profile: bool,
                    wlan0: bool = True, entry: str = "sequence",
                    wmt_fails: bool = False,
-                   vendor_assets_ok: bool = True) -> dict:
+                   vendor_assets_ok: bool = True,
+                   target: str | None = None,
+                   lidar_firmware: bool = True,
+                   hci0: bool = False,
+                   bt_bound: bool = True,
+                   sdio: bool = True) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for directory in ("bin", "sbin", "dev", "etc/wifi", "run", "tmp",
-                              "sys/class/net"):
+                              "sys/class/net", "sys/class/bluetooth",
+                              "sys/bus/sdio/drivers/mt7668_sdio",
+                              "sys/bus/sdio/drivers/btmtksdio",
+                              "lib/firmware/mediatek"):
                 (root / directory).mkdir(parents=True, exist_ok=True)
+            lidar_names = {"wlan": "mmc2:0001:1", "bt": "mmc2:0001:2"}
+            if target == "lidar":
+                for name, device_id in (("wlan", "0x7608"), ("bt", "0x7668")):
+                    if not sdio:
+                        continue
+                    device = root / "sys/bus/sdio/devices" / lidar_names[name]
+                    device.mkdir(parents=True, exist_ok=True)
+                    (device / "device").write_text(device_id + "\n")
+                for relative in ("drivers/mt7668_sdio/bind",
+                                 "drivers/btmtksdio/bind",
+                                 "drivers/btmtksdio/unbind"):
+                    (root / "sys/bus/sdio" / relative).touch()
+                if bt_bound and sdio:
+                    (root / "sys/bus/sdio/drivers/btmtksdio"
+                     / lidar_names["bt"]).touch()
+                if hci0:
+                    (root / "sys/class/bluetooth/hci0").touch()
+                if lidar_firmware:
+                    (root / "lib/firmware/WIFI_RAM_CODE_MT7668.bin").touch()
+                    (root / "lib/firmware/WIFI_RAM_CODE2_SDIO_MT7668.bin").touch()
+                    (root / "lib/firmware/mt7668_patch_e2_hdr.bin").touch()
             (root / "proc-mounts").write_text(
                 "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\n")
             if packaged_profile:
@@ -608,6 +637,13 @@ class RecoveryWorkerRadioPathTests(unittest.TestCase):
                 self.assertIn(old, sequence, old)
                 sequence = sequence.replace(old, new)
             functions = self._function("recovery_owns_radio()")
+            if target == "lidar":
+                for name in ("lidar_sdio_devices()", "lidar_radio_bringup()",
+                             "lidar_radio_after_wlan0()"):
+                    lidar_body = self._function(name)
+                    for old, new in self.REPLACEMENTS:
+                        lidar_body = lidar_body.replace(old, new)
+                    functions += lidar_body
             functions += sequence
             call = "start_wifi_network_sequence"
             if entry == "activation":
@@ -621,14 +657,20 @@ class RecoveryWorkerRadioPathTests(unittest.TestCase):
                 "BB=$SB/bin/busybox\n"
                 "export FAKE_PIDFILE=\"$SB/run/responder.pid\"\n"
                 "export FAKE_WMTWIFI=\"$SB/dev/wmtWifi\"\n"
-                "export FAKE_WAIT_PIDFILE=1\n"
+                "export FAKE_WAIT_PIDFILE="
+                + ("" if target == "lidar" else "1") + "\n"
                 "export WMT_CONFIGURE_LOG=\"$SB/wmt-configure.log\"\n"
                 "export WIFI_CLIENT_LOG=\"$SB/client.log\"\n"
                 "PHYSICAL_RECOVERY_MARKER=\"$SB/run/recovery-mode\"\n"
                 "RECOVERY_WLAN0_MARKER=\"$SB/run/wlan0-ready\"\n"
                 "RECOVERY_WIFI_FAILED_MARKER=\"$SB/run/wifi-worker-failed\"\n"
                 "VENDOR_ASSETS_OK=" + ("1" if vendor_assets_ok else "0") + "\n"
-                "log() { printf 'log:%s\\n' \"$1\"; }\n"
+                + ("TARGET_ID=lidar\n"
+                   "LIDAR_SDIO_ROOT=\"$SB/sys/bus/sdio\"\n"
+                   "LIDAR_BLUETOOTH_ROOT=\"$SB/sys/class/bluetooth\"\n"
+                   "LIDAR_FIRMWARE_ROOT=\"$SB/lib/firmware\"\n"
+                   "LIDAR_BT_WAIT=0\n" if target == "lidar" else "")
+                + "log() { printf 'log:%s\\n' \"$1\"; }\n"
                 + functions
                 + "\n" + call + "\nprintf 'worker_rc=%s\\n' \"$?\"\n")
             result = subprocess.run(["sh", "-c", script], capture_output=True,
@@ -649,8 +691,17 @@ class RecoveryWorkerRadioPathTests(unittest.TestCase):
                                   if failed_marker.exists() else ""),
                 "profile_state": (profile_state.read_text().strip()
                                   if profile_state.exists() else ""),
+                "wlan_bind": (root / "sys/bus/sdio/drivers/mt7668_sdio"
+                              / "bind").read_text() if target == "lidar" else "",
+                "bt_bound": (root / "sys/bus/sdio/drivers/btmtksdio"
+                             / lidar_names["bt"]).exists(),
+                "bt_unbind": (root / "sys/bus/sdio/drivers/btmtksdio"
+                              / "unbind").read_text() if target == "lidar" else "",
+                "bt_rebind": (root / "sys/bus/sdio/drivers/btmtksdio"
+                              / "bind").read_text() if target == "lidar" else "",
             }
 
+class RecoveryWorkerRadioPathTests(_WorkerHarness):
     def test_no_profile_recovery_boot_initializes_the_radio(self) -> None:
         run = self.run_worker(recovery=True, packaged_profile=False)
         self.assertEqual(run["rc"], "worker_rc=0",
@@ -722,6 +773,68 @@ class RecoveryWorkerRadioPathTests(unittest.TestCase):
         self.assertIn("log:wifi-worker-failed-recorded:4", run["stdout"])
         self.assertEqual(run["failed_marker"], "4")
         self.assertFalse(run["wmt_configured"])
+
+
+class LidarWorkerRadioPathTests(_WorkerHarness):
+    """Lidar binds MT7668 from the SDIO function, never the WMT choreography."""
+
+    def test_hci0_ready_binds_wlan_without_releasing_bluetooth(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=True,
+                              target="lidar", hci0=True)
+        self.assertEqual(run["rc"], "worker_rc=0",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:lidar-bt-ready-before-wlan\n", run["stdout"])
+        self.assertIn("log:lidar-wlan-bound:mmc2:0001:1\n", run["stdout"])
+        self.assertEqual(run["wlan_bind"], "mmc2:0001:1")
+        self.assertTrue(run["bt_bound"])
+        self.assertEqual(run["bt_unbind"], "")
+        self.assertEqual(run["bt_rebind"], "")
+        self.assertFalse(run["wmt_configured"])
+        self.assertTrue(run["client_started"])
+        self.assertNotIn("lidar-bt-unbound", run["stdout"])
+
+    def test_late_hci0_releases_bt_then_rebinds_after_wlan0(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=True,
+                              target="lidar", hci0=False)
+        self.assertEqual(run["rc"], "worker_rc=0",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:lidar-bt-unbound-before-wlan\n", run["stdout"])
+        self.assertEqual(run["bt_unbind"], "mmc2:0001:2")
+        self.assertEqual(run["wlan_bind"], "mmc2:0001:1")
+        self.assertEqual(run["bt_rebind"], "mmc2:0001:2")
+        self.assertIn("log:lidar-bt-rebound-after-wlan:mmc2:0001:2\n",
+                      run["stdout"])
+        self.assertFalse(run["wmt_configured"])
+
+    def test_unbound_bluetooth_is_not_released_again(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=True,
+                              target="lidar", hci0=False, bt_bound=False)
+        self.assertEqual(run["rc"], "worker_rc=0",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:lidar-bt-not-bound-before-wlan\n", run["stdout"])
+        self.assertEqual(run["bt_unbind"], "")
+        self.assertEqual(run["bt_rebind"], "")
+        self.assertEqual(run["wlan_bind"], "mmc2:0001:1")
+
+    def test_missing_ram_code_is_exit_five(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=True,
+                              entry="activation", target="lidar",
+                              lidar_firmware=False)
+        self.assertEqual(run["rc"], "worker_rc=5",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-lidar-firmware-absent:"
+                      "WIFI_RAM_CODE_MT7668.bin\n", run["stdout"])
+        self.assertEqual(run["failed_marker"], "5")
+        self.assertEqual(run["wlan_bind"], "")
+
+    def test_missing_sdio_function_is_exit_six(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=True,
+                              entry="activation", target="lidar", sdio=False)
+        self.assertEqual(run["rc"], "worker_rc=6",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-lidar-sdio-function-absent\n", run["stdout"])
+        self.assertEqual(run["failed_marker"], "6")
+        self.assertEqual(run["wlan_bind"], "")
 
 
 if __name__ == "__main__":

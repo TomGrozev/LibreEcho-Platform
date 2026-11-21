@@ -1188,13 +1188,27 @@ else
     log boot-diagnostics-unavailable
 fi
 VENDOR_ASSETS_OK=0
-if [ "${DATA_MOUNTED:-0}" -eq 1 ] &&
-        [ -x /usr/local/sbin/libreecho-vendor-import ] &&
-        [ -x /sbin/wmt_configure ] &&
+# The importer reads the owner's stock system_a. It selects the firmware family
+# from /etc/libreecho/target: the MT8163 WMT set or the Lidar MT7668 set. The
+# wmt helpers only exist for the MT8163 stack, so they gate the import only on
+# an MT8163 target; Lidar needs no helper to import its own layout. Loading the
+# identity here also sets TARGET_ID for the target-specific Wi-Fi bring-up.
+load_image_target || true
+vendor_tools_present=0
+if [ -x /sbin/wmt_configure ] &&
         [ -x /sbin/wmt_responder ] &&
         [ -x /sbin/wmt_bt_on ] &&
         [ -x /sbin/wmt_stock_compat ] &&
         [ -x /sbin/wmt_launcher ]; then
+    vendor_tools_present=1
+fi
+vendor_import_ready=0
+if [ "${TARGET_ID:-}" = lidar ] || [ "$vendor_tools_present" -eq 1 ]; then
+    vendor_import_ready=1
+fi
+if [ "${DATA_MOUNTED:-0}" -eq 1 ] &&
+        [ -x /usr/local/sbin/libreecho-vendor-import ] &&
+        [ "$vendor_import_ready" -eq 1 ]; then
     if DATA_ROOT=/data /usr/local/sbin/libreecho-vendor-import \
             >/tmp/vendor-import.log 2>&1; then
         VENDOR_ASSETS_OK=1
@@ -1375,6 +1389,103 @@ recovery_radio_ready_wait()
     return 1
 }
 
+# Lidar MT7668 radio. The image ships the shared ROM patch; the importer stages
+# the two RAM codes and the per-unit calibration. Binding WLAN while btmtksdio
+# is still downloading the shared patch races, so wait for hci0 first. When BT
+# has not settled in the bound, release its SDIO function until wlan0 exists and
+# bind it again afterwards. Distinct return codes keep the failure legible:
+# 5 firmware absent, 6 SDIO function absent/unbind failed, 7 WLAN bind failed.
+LIDAR_SDIO_ROOT=${LIDAR_SDIO_ROOT:-/sys/bus/sdio}
+LIDAR_BLUETOOTH_ROOT=${LIDAR_BLUETOOTH_ROOT:-/sys/class/bluetooth}
+LIDAR_FIRMWARE_ROOT=${LIDAR_FIRMWARE_ROOT:-/lib/firmware}
+LIDAR_BT_WAIT=${LIDAR_BT_WAIT:-15}
+LIDAR_BT_REBIND=
+
+lidar_sdio_devices()
+{
+    lidar_wlan_dev=
+    lidar_bt_dev=
+    for lidar_dev_path in "$LIDAR_SDIO_ROOT"/devices/*; do
+        [ -r "$lidar_dev_path/device" ] || continue
+        lidar_dev_id=$($BB cat "$lidar_dev_path/device" 2>/dev/null)
+        lidar_dev_name=${lidar_dev_path##*/}
+        case "$lidar_dev_id" in
+            0x7608) lidar_wlan_dev=$lidar_dev_name ;;
+            0x7668) lidar_bt_dev=$lidar_dev_name ;;
+        esac
+    done
+}
+
+lidar_radio_bringup()
+{
+    for lidar_fw in WIFI_RAM_CODE_MT7668.bin WIFI_RAM_CODE2_SDIO_MT7668.bin; do
+        [ -f "$LIDAR_FIRMWARE_ROOT/$lidar_fw" ] || {
+            log "wifi-lidar-firmware-absent:$lidar_fw"
+            return 5
+        }
+    done
+    if [ ! -f "$LIDAR_FIRMWARE_ROOT/mt7668_patch_e2_hdr.bin" ] &&
+            [ ! -f "$LIDAR_FIRMWARE_ROOT/mediatek/mt7668pr2h.bin" ]; then
+        log wifi-lidar-patch-absent
+        return 5
+    fi
+    lidar_sdio_devices
+    [ -n "$lidar_wlan_dev" ] || {
+        log wifi-lidar-sdio-function-absent
+        return 6
+    }
+    LIDAR_BT_REBIND=
+    lidar_wait=0
+    while [ "$lidar_wait" -lt "$LIDAR_BT_WAIT" ] &&
+            [ ! -e "$LIDAR_BLUETOOTH_ROOT/hci0" ]; do
+        $BB sleep 1
+        lidar_wait=$((lidar_wait + 1))
+    done
+    if [ -e "$LIDAR_BLUETOOTH_ROOT/hci0" ]; then
+        log lidar-bt-ready-before-wlan
+    elif [ -n "$lidar_bt_dev" ] &&
+            [ -e "$LIDAR_SDIO_ROOT/drivers/btmtksdio/$lidar_bt_dev" ]; then
+        if printf '%s' "$lidar_bt_dev" > \
+                "$LIDAR_SDIO_ROOT/drivers/btmtksdio/unbind" \
+                2>/tmp/wifi-lidar-bt-unbind.log; then
+            LIDAR_BT_REBIND=$lidar_bt_dev
+            log lidar-bt-unbound-before-wlan
+        else
+            log wifi-lidar-bt-unbind-failed
+            return 6
+        fi
+    else
+        log lidar-bt-not-bound-before-wlan
+    fi
+    if [ -e "$LIDAR_SDIO_ROOT/drivers/mt7668_sdio/$lidar_wlan_dev" ]; then
+        log lidar-wlan-already-bound
+        return 0
+    fi
+    if printf '%s' "$lidar_wlan_dev" > \
+            "$LIDAR_SDIO_ROOT/drivers/mt7668_sdio/bind" \
+            2>/tmp/wifi-lidar-bind.log; then
+        log "lidar-wlan-bound:$lidar_wlan_dev"
+    else
+        log wifi-lidar-bind-failed
+        return 7
+    fi
+    return 0
+}
+
+lidar_radio_after_wlan0()
+{
+    [ -n "${LIDAR_BT_REBIND:-}" ] || return 0
+    if printf '%s' "$LIDAR_BT_REBIND" > \
+            "$LIDAR_SDIO_ROOT/drivers/btmtksdio/bind" \
+            2>/tmp/wifi-lidar-bt-bind.log; then
+        log "lidar-bt-rebound-after-wlan:$LIDAR_BT_REBIND"
+    else
+        log wifi-lidar-bt-rebind-failed
+    fi
+    LIDAR_BT_REBIND=
+    return 0
+}
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -1440,6 +1551,10 @@ start_wifi_network_sequence()
             log wifi-profile-record-failed
         fi
     fi
+    if [ "${TARGET_ID:-}" = lidar ]; then
+        lidar_radio_bringup && lidar_rc=0 || lidar_rc=$?
+        [ "$lidar_rc" -eq 0 ] || return "$lidar_rc"
+    else
     # This is the proven manual choreography from session e8c21eb3bbae:
     # stock-compatible configure-only init, stale-launcher cleanup, exactly one
     # one-shot command responder, then one timed Wi-Fi function-on write.  Do
@@ -1492,6 +1607,7 @@ start_wifi_network_sequence()
     log "wifi-launcher-rc:$responder_rc"
     [ "$responder_rc" -eq 0 ] || { log wifi-launcher-failed; return 1; }
     [ "$wifi_on_rc" -eq 0 ] || { log wifi-function-on-failed; return "$wifi_on_rc"; }
+    fi
     i=0
     while [ "$i" -lt 30 ] && [ ! -e /sys/class/net/wlan0 ]; do
         $BB sleep 1
@@ -1506,6 +1622,12 @@ start_wifi_network_sequence()
         log wlan0-ready-recorded
     else
         log wlan0-ready-record-failed
+    fi
+    # Lidar: the WLAN patch download is complete once wlan0 exists, so it is
+    # safe to let btmtksdio claim function 2 again if the bring-up had to
+    # release it (see lidar_radio_bringup).
+    if [ "${TARGET_ID:-}" = lidar ]; then
+        lidar_radio_after_wlan0
     fi
     # Recovery boot: the driver is up and wlan0 exists for the AP probe and
     # hostapd, but the portal owns the radio, so never start the client

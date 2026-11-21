@@ -18,6 +18,29 @@ TOOLS_DIR = Path(__file__).resolve().parent
 IMPORTER = TOOLS_DIR / "initramfs/libreecho-vendor-import"
 SHIPPED_SPEC_DIR = TOOLS_DIR / "initramfs/vendor-assets"
 V2_SPEC = SHIPPED_SPEC_DIR / "mt8163-v181-stock-v2.tsv"
+LIDAR_BUNDLE_ID = "lidar-mt7668-stock-v1"
+LIDAR_SPEC = SHIPPED_SPEC_DIR / (LIDAR_BUNDLE_ID + ".tsv")
+LIDAR_FILES = (
+    "WIFI_RAM_CODE_MT7668.bin",
+    "WIFI_RAM_CODE2_SDIO_MT7668.bin",
+    "EEPROM_MT7668.bin",
+    "TxPwrLimit_MT76x8.dat",
+    "wifi.cfg",
+)
+# The importer pins the two MT7668 RAM codes and bounds the per-unit
+# calibration.  The contract under test is the layout, inventory and pin
+# enforcement, not the vendor payload, so the fixtures take their sizes from
+# the shipped spec and carry synthetic bytes.
+LIDAR_PER_UNIT_SIZES = {
+    "EEPROM_MT7668.bin": 1024,
+    "TxPwrLimit_MT76x8.dat": 64,
+    "wifi.cfg": 32,
+}
+LIDAR_HASH_CONSTANTS = {
+    "WIFI_RAM_CODE_MT7668.bin": ("LIDAR_RAM_CODE_HASH", "LIDAR_RAM_CODE_SIZE"),
+    "WIFI_RAM_CODE2_SDIO_MT7668.bin": ("LIDAR_CR4_CODE_HASH",
+                                       "LIDAR_CR4_CODE_SIZE"),
+}
 TARGETS = (
     "ROMv2_lm_patch_1_0_hdr.bin",
     "ROMv2_lm_patch_1_1_hdr.bin",
@@ -60,6 +83,69 @@ def manifest_lines(payloads: dict[str, bytes], source_layout: str = "system/vend
     return "".join(lines)
 
 
+def shipped_lidar_records() -> dict[str, tuple[str, str]]:
+    """The digest/size rows of the shipped Lidar spec, keyed by target name."""
+    records = {}
+    for line in LIDAR_SPEC.read_text().splitlines():
+        if not line:
+            continue
+        digest, size, _source, name = line.split("|")
+        records[name] = (digest, size)
+    return records
+
+
+def sized_fixture(size: int, seed: bytes) -> bytes:
+    return (seed * (size // len(seed) + 1))[:size]
+
+
+def synthetic_lidar_payloads(
+        records: dict[str, tuple[str, str]]) -> dict[str, bytes]:
+    payloads = {}
+    for name in LIDAR_FILES:
+        digest, size = records[name]
+        length = LIDAR_PER_UNIT_SIZES[name] if digest == "per-unit" else int(size)
+        payloads[name] = sized_fixture(
+            length, f"{name}:synthetic-lidar-fixture\n".encode())
+    return payloads
+
+
+def lidar_fixture(root: Path) -> tuple[Path, Path, dict[str, bytes]]:
+    """A spec and importer copy pinned to synthetic RAM-code digests.
+
+    The importer's RAM-code digests are compile-time constants, so the copy
+    carries the fixture digests and the spec rows carry the matching hashes.
+    Sizes stay those of the shipped spec, so the size pin is still exercised.
+    """
+    records = shipped_lidar_records()
+    payloads = synthetic_lidar_payloads(records)
+    spec_dir = root / "specs"
+    spec_dir.mkdir()
+    rows = []
+    for name in LIDAR_FILES:
+        digest, _size = records[name]
+        source = f"system/vendor/firmware/{name}"
+        if digest == "per-unit":
+            rows.append(f"per-unit|-|{source}|{name}\n")
+            continue
+        payload = payloads[name]
+        rows.append(f"{hashlib.sha256(payload).hexdigest()}|{len(payload)}|"
+                    f"{source}|{name}\n")
+    (spec_dir / (LIDAR_BUNDLE_ID + ".tsv")).write_text("".join(rows))
+
+    script = IMPORTER.read_text()
+    for name, (hash_constant, size_constant) in LIDAR_HASH_CONSTANTS.items():
+        digest, size = records[name]
+        payload = payloads[name]
+        script = script.replace(f"{hash_constant}={digest}",
+                                f"{hash_constant}={hashlib.sha256(payload).hexdigest()}")
+        script = script.replace(f"{size_constant}={size}",
+                                f"{size_constant}={len(payload)}")
+    importer = root / "libreecho-vendor-import"
+    importer.write_text(script)
+    importer.chmod(0o755)
+    return importer, spec_dir, payloads
+
+
 class VendorImporterCompatTests(unittest.TestCase):
     def run_importer(
         self,
@@ -69,12 +155,16 @@ class VendorImporterCompatTests(unittest.TestCase):
         spec_dir: Path = SHIPPED_SPEC_DIR,
         force: bool = False,
         target: str | None = None,
+        firmware_seed: dict[str, bytes] | None = None,
+        importer: Path = IMPORTER,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         data = root / "data"
         config = data / "libreecho/config"
         firmware = root / "runtime-firmware"
         config.mkdir(parents=True, exist_ok=True)
         firmware.mkdir(parents=True, exist_ok=True)
+        for name, payload in (firmware_seed or {}).items():
+            (firmware / name).write_bytes(payload)
         force_marker = config / "vendor-import-force-next-boot"
         if force:
             force_marker.write_text("force-unverified-owner-local-import-v1\n")
@@ -94,7 +184,7 @@ class VendorImporterCompatTests(unittest.TestCase):
             "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
         }
         result = subprocess.run(
-            ["/bin/sh", str(IMPORTER)],
+            ["/bin/sh", str(importer)],
             env=environment,
             text=True,
             stdout=subprocess.PIPE,
@@ -104,21 +194,93 @@ class VendorImporterCompatTests(unittest.TestCase):
         )
         return result, config / "vendor-assets.tsv", Path(environment["LIBREECHO_VENDOR_STATUS_PATH"])
 
-    def test_lidar_reports_not_applicable_without_reading_system_a(self) -> None:
+    def test_lidar_rejects_a_ram_code_set_outside_the_pin(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            # The source root does not exist: a Lidar run must stop before it
-            # checks or mounts system_a.
+            source = root / "system-a"
+            write_payloads(source, {
+                "WIFI_RAM_CODE_MT7668.bin": b"not-the-pinned-ram-code",
+                "WIFI_RAM_CODE2_SDIO_MT7668.bin": b"not-the-pinned-cr4-code",
+                "EEPROM_MT7668.bin": bytes(1024),
+                "TxPwrLimit_MT76x8.dat": b"calibration\n",
+                "wifi.cfg": b"ssid=test\n",
+            })
+            # Lidar has no force path: even a force marker must not bless an
+            # unrecognised RAM-code pair.
             result, enrolled, status = self.run_importer(
-                root, root / "missing-system-a", target="lidar")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("VENDOR_IMPORT_NOT_APPLICABLE target=lidar", result.stdout)
+                root, source, target="lidar", force=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("VENDOR_IMPORT_LIDAR_SET_INVALID", result.stderr)
+            self.assertNotIn("VENDOR_IMPORT_LIDAR_INSTALLED", result.stdout)
             self.assertEqual(status.read_text(),
-                             "state=not-applicable\nverification=none\n"
+                             "state=failed\nverification=none\n"
                              "source_partition=system_a\nsource_layout=none\n"
                              "force_requested=0\n"
-                             "error=target-mt8167-no-mt8163-firmware\n")
+                             "error=VENDOR_IMPORT_LIDAR_SET_INVALID\n")
             self.assertFalse(enrolled.exists())
+            self.assertEqual(list((root / "runtime-firmware").iterdir()), [])
+
+    def test_lidar_pinned_set_imports_runtime_files_and_keeps_the_patch(self) -> None:
+        patch = b"image-owned-mt7668-patch\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "system-a"
+            importer, spec_dir, payloads = lidar_fixture(root)
+            write_payloads(source, payloads)
+            result, enrolled, status = self.run_importer(
+                root, source, target="lidar", spec_dir=spec_dir,
+                importer=importer,
+                firmware_seed={"mt7668_patch_e2_hdr.bin": patch})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("VENDOR_IMPORT_LIDAR_INSTALLED "
+                          "verification=lidar-hash-pinned-ram-per-unit-calibration "
+                          "source_layout=system/vendor/firmware\n", result.stdout)
+            self.assertEqual(status.read_text(),
+                             "state=imported\n"
+                             "verification=lidar-hash-pinned-ram-per-unit-calibration\n"
+                             "source_partition=system_a\n"
+                             "source_layout=system/vendor/firmware\n"
+                             "force_requested=0\nerror=none\n")
+            # The importer never enrols a Lidar set.
+            self.assertFalse(enrolled.exists())
+            runtime = root / "runtime-firmware"
+            for name, payload in payloads.items():
+                target = runtime / name
+                self.assertEqual(target.read_bytes(), payload)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual((runtime / "mt7668_patch_e2_hdr.bin").read_bytes(),
+                             patch)
+            self.assertFalse((runtime / "WIFI_RAM_CODE").exists())
+
+    def test_lidar_replaces_per_unit_calibration_on_every_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "system-a"
+            importer, spec_dir, payloads = lidar_fixture(root)
+            write_payloads(source, payloads)
+            self.run_importer(root, source, target="lidar", spec_dir=spec_dir,
+                              importer=importer)
+            # Re-provisioned unit: only the calibration changed.
+            (source / "system/vendor/firmware/EEPROM_MT7668.bin").write_bytes(
+                bytes([0x5a]) * 1024)
+            shutil.rmtree(root / "runtime-firmware")
+            shutil.rmtree(root / "run")
+            result, _, _ = self.run_importer(root, source, target="lidar",
+                                            spec_dir=spec_dir,
+                                            importer=importer)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (root / "runtime-firmware/EEPROM_MT7668.bin").read_bytes(),
+                bytes([0x5a]) * 1024)
+
+    def test_shipped_lidar_spec_pins_match_the_importer_constants(self) -> None:
+        script = IMPORTER.read_text()
+        records = shipped_lidar_records()
+        self.assertEqual(set(records), set(LIDAR_FILES))
+        for name, (hash_constant, size_constant) in LIDAR_HASH_CONSTANTS.items():
+            digest, size = records[name]
+            self.assertIn(f"{hash_constant}={digest}", script)
+            self.assertIn(f"{size_constant}={size}", script)
 
     def test_second_validated_revision_is_shipped_as_one_atomic_manifest(self) -> None:
         self.assertEqual(
