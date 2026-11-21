@@ -697,6 +697,70 @@ create_input_nodes()
     INPUT_NODES_CREATED=$nodes
 }
 
+# Lidar puts its EFR32 radio on uart2 (ttyS2 through the board's serial2 alias)
+# and controls it through a GPIO character device.  The kernel numbers both the
+# same way on every boot, but the reduced ramdisk has no devtmpfs, so userspace
+# only sees them if init materializes the nodes.  Create each node only when
+# sysfs shows the kernel device, so an image without the port or chip cannot
+# hand userspace a dangling device.
+create_lidar_serial_gpio_nodes()
+{
+    nodes=0
+    LIDAR_SERIAL_NODE=0
+    if [ -e /sys/class/tty/ttyS2 ]; then
+        ensure_chr /dev/ttyS2 4 66
+        if [ -c /dev/ttyS2 ]; then
+            $BB chmod 0660 /dev/ttyS2 2>/dev/null
+            LIDAR_SERIAL_NODE=1
+            nodes=$((nodes + 1))
+        fi
+    fi
+    for sys_gpio in /sys/bus/gpio/devices/gpiochip*; do
+        [ -r "$sys_gpio/uevent" ] || continue
+        name=${sys_gpio##*/}
+        case "$name" in
+            gpiochip[0-9]*) ;;
+            *) continue ;;
+        esac
+        major=$($BB sed -n 's/^MAJOR=//p' "$sys_gpio/uevent" 2>/dev/null |
+            $BB head -n 1)
+        minor=$($BB sed -n 's/^MINOR=//p' "$sys_gpio/uevent" 2>/dev/null |
+            $BB head -n 1)
+        case "$major" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        case "$minor" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        target="/dev/$name"
+        if [ ! -c "$target" ]; then
+            $BB rm -f "$target"
+            $BB mknod "$target" c "$major" "$minor" 2>/dev/null || continue
+        fi
+        [ -c "$target" ] || continue
+        $BB chmod 0660 "$target" 2>/dev/null
+        nodes=$((nodes + 1))
+    done
+    LIDAR_NODES_CREATED=$nodes
+    LIDAR_GPIO_NODES_CREATED=$((nodes - LIDAR_SERIAL_NODE))
+}
+
+lidar_node_worker()
+{
+    i=0
+    while [ "$i" -lt 20 ]; do
+        create_lidar_serial_gpio_nodes
+        if [ -c /dev/ttyS2 ] && [ "${LIDAR_GPIO_NODES_CREATED:-0}" -gt 0 ]; then
+            log "lidar-devnodes-created:$LIDAR_NODES_CREATED"
+            return 0
+        fi
+        $BB sleep 1
+        i=$((i + 1))
+    done
+    log "lidar-devnodes-timeout:${LIDAR_NODES_CREATED:-0}"
+    return 1
+}
+
 log init-started
 pmsg_marker init-started
 
@@ -795,6 +859,13 @@ input_node_worker()
 }
 input_node_worker &
 log input-node-worker-started
+
+# Only Lidar wires a UART and a GPIO character device into userspace.  The
+# board identity is immutable image policy, so this gate needs no userdata.
+if load_image_target && [ "$TARGET_ID" = lidar ]; then
+    lidar_node_worker &
+    log lidar-node-worker-started
+fi
 
 # Linux 6.1 has no Android android_usb class.  Compose an ADB-only gadget with
 # ConfigFS and FunctionFS, and bind the UDC only after adbd publishes endpoints.
