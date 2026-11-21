@@ -661,6 +661,34 @@ def add_lidar_ota_tools(stage: Path, bootctl: Path, verifier: Path,
     }
 
 
+def add_lidar_network(stage: Path, manifest: dict[str, object],
+                      supplicant: Path) -> None:
+    """Stage the WLAN client supplicant the initramfs scripts start.
+
+    Lidar has no MT8163 WMT connectivity bundle: the MT7668 driver is
+    mac80211/nl80211, so a plain static wpa_supplicant is all that the shared
+    initramfs needs.  udhcpc is the bundled BusyBox applet and is already
+    linked at build time.
+    """
+    if supplicant.is_symlink() or not supplicant.is_file():
+        raise BuildError(f'wpa_supplicant is not a regular file: {supplicant}')
+    data = read(supplicant)
+    relative = 'sbin/wpa_supplicant'
+    destination = stage / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
+    destination.chmod(0o755)
+    elf = shared.require_elf_contract(destination, 0x05000400, None, (), False)
+    manifest['network'] = {
+        'wpa_supplicant': {
+            'sha256': sha256(data),
+            'size': len(data),
+            'path': '/' + relative,
+            'elf': elf,
+        },
+    }
+
+
 def validate_ui_and_mdns_inputs(args: argparse.Namespace) -> bool:
     """Apply the shared UI and discovery input rules; return whether UI is staged."""
     ui_options = {
@@ -750,6 +778,8 @@ def main() -> None:
                         help='expected LibreEcho-UI source diff identity')
     parser.add_argument('--qemu-arm', default='qemu-arm-static',
                         help='user-mode ARM emulator used to inventory BusyBox applets')
+    parser.add_argument('--wpa-supplicant', type=Path,
+                        help='staged static ARM32 wpa_supplicant for the WLAN client')
     parser.add_argument('--audio-probe', type=Path,
                         help='MT8163-only optional payload; refused for lidar')
     parser.add_argument('--wifi-dtb', type=Path,
@@ -849,6 +879,8 @@ def main() -> None:
                             args.target_descriptor_sha256)
         add_lidar_wifi_firmware(stage, manifest, args.wifi_patch.resolve(),
                                 args.wifi_licence.resolve())
+        if args.wpa_supplicant is not None:
+            add_lidar_network(stage, manifest, args.wpa_supplicant.resolve())
         if ui_enabled:
             shared.add_ui_bundle(
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),

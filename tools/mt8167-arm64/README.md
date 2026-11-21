@@ -38,7 +38,18 @@ because an audio profile is present.
 
 The shared `init.rc` imports `/init.recovery.${ro.hardware}.rc`, so the overlay
 keeps `ro.hardware=mt8163`; this is a userspace file-selection name, not a
-board test.  The board identity is `/etc/libreecho/target`.
+board test. The board identity is `/etc/libreecho/target`.
+
+## WLAN client
+
+The MT7668 driver is mac80211/nl80211, so the profile stages a plain static
+ARM32 `wpa_supplicant` 2.10 at `/sbin/wpa_supplicant` through
+`--wpa-supplicant`. `libreecho-wifi` starts it against the profile selected by
+`libreecho-init` (`/data/libreecho/config/wpa_supplicant.conf`, or the packaged
+`/etc/wifi/wpa_supplicant.conf`), and `udhcpc` is the BusyBox applet. The
+verifier rejects the member unless it is static ARM32 hard-float and matches
+`--expected-wpa-supplicant-sha256`. MT8163's WMT connectivity bundle,
+`--wifi-dtb` and `--audio-probe` remain refused.
 
 ## Boot envelope
 

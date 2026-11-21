@@ -477,6 +477,25 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, Any], target: str,
                 name.startswith('lib/firmware/') and base.startswith('ROMv2_')):
             fail(f'MT8163 Wi-Fi member in a Lidar image: {name}')
 
+    network = manifest.get('network')
+    if network is not None:
+        if not isinstance(network, dict) or not isinstance(
+                network.get('wpa_supplicant'), dict):
+            fail('manifest has a malformed network record')
+        supplicant = network['wpa_supplicant']
+        pin = expected.get('wpa_supplicant')
+        digest = str(supplicant.get('sha256'))
+        if pin is not None and digest != pin:
+            fail('wpa_supplicant hash differs from the caller pin')
+        entry = require_member(entries, 'sbin/wpa_supplicant', digest, 0o755)
+        if supplicant.get('size') != len(entry.data):
+            fail('wpa_supplicant size differs from the manifest')
+        info = shared.elf_info(entry.data)
+        if info != (1, 40, 0x05000400, None, (), False):
+            fail(f'wpa_supplicant is not a static ARM32 hard-float executable: {info!r}')
+    elif expected.get('wpa_supplicant') is not None:
+        fail('a wpa_supplicant pin was given but the image stages none')
+
     validate_thread(entries, manifest)
 
     for relative, text in (
@@ -716,6 +735,8 @@ def main() -> None:
     parser.add_argument('--expected-mdns-runtime-manifest-sha256',
                         help='require this shared mDNS runtime manifest hash when '
                              'the boot-contained discovery runtime is staged')
+    parser.add_argument('--expected-wpa-supplicant-sha256',
+                        help='require this staged static ARM32 wpa_supplicant')
     parser.add_argument('--image-profile', choices=('development', 'ota'), required=True)
     parser.add_argument('--service-profile', choices=('diagnostic', 'production'),
                         required=True)
@@ -743,6 +764,7 @@ def main() -> None:
         'service_profile': args.service_profile,
         'feature_policy': args.feature_policy,
         'update_channel': args.update_channel,
+        'wpa_supplicant': args.expected_wpa_supplicant_sha256,
         'stock_collection': args.expected_stock_dtb_collection_sha256,
         'stock_pvt': args.expected_stock_pvt_sha256,
     }
