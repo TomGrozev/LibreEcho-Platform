@@ -1,0 +1,5 @@
+9240c5182c89bdd98bda2655e01053ef8ea06afd45d61cf6ada3f11d65956e7d|459528|system/vendor/firmware/WIFI_RAM_CODE_MT7668.bin|WIFI_RAM_CODE_MT7668.bin
+35faff6a613fefcbe33a6f6d8df885be76c546f9e78ba8ab93056a816ad87254|51816|system/vendor/firmware/WIFI_RAM_CODE2_SDIO_MT7668.bin|WIFI_RAM_CODE2_SDIO_MT7668.bin
+per-unit|-|system/vendor/firmware/EEPROM_MT7668.bin|EEPROM_MT7668.bin
+per-unit|-|system/vendor/firmware/TxPwrLimit_MT76x8.dat|TxPwrLimit_MT76x8.dat
+per-unit|-|system/vendor/firmware/wifi.cfg|wifi.cfg

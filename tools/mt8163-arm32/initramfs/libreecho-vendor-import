@@ -1,8 +1,9 @@
 #!/bin/sh
-# Import the minimum MT8163 connectivity firmware from the owner's stock OS.
-# No vendor bytes are distributed or persisted by LibreEcho.  Unknown complete
-# owner-local sets may be explicitly enrolled by hash after structural checks;
-# only that hash/size manifest is persisted, never the vendor payload bytes.
+# Import the minimum connectivity firmware from the owner's stock OS.
+# No vendor bytes are distributed or persisted by LibreEcho.  The MT8163 set is
+# hash-pinned or enrolled after structural checks; the Lidar set pins the two
+# MT7668 RAM codes and bounds the per-unit calibration.  Only hash/size
+# identity is persisted, never the vendor payload bytes.
 set -eu
 
 DATA_ROOT=${DATA_ROOT:-/data}
@@ -15,6 +16,14 @@ TEST_MODE=${LIBREECHO_VENDOR_TEST_MODE:-0}
 # Dot whose stock hashes to v3. The revision tracks the owner's stock build, not
 # the product, so either can appear on either unit.
 BUNDLE_ID=mt8163-v181-stock-v1
+LIDAR_BUNDLE_ID=lidar-mt7668-stock-v1
+# The MT7668 RAM codes are pinned by hash; the calibration files carry per-unit
+# MAC, power and regulatory data, so they are bounded by size instead.
+LIDAR_RAM_CODE_HASH=9240c5182c89bdd98bda2655e01053ef8ea06afd45d61cf6ada3f11d65956e7d
+LIDAR_RAM_CODE_SIZE=459528
+LIDAR_CR4_CODE_HASH=35faff6a613fefcbe33a6f6d8df885be76c546f9e78ba8ab93056a816ad87254
+LIDAR_CR4_CODE_SIZE=51816
+VARIANT=mt8163
 SPEC_DIR=${LIBREECHO_VENDOR_SPEC_DIR:-/etc/libreecho/vendor-assets}
 SPEC_OVERRIDE=${LIBREECHO_VENDOR_SPEC:-}
 SPEC=${SPEC_OVERRIDE:-$SPEC_DIR/$BUNDLE_ID.tsv}
@@ -80,17 +89,43 @@ prepare_status_path()
     fi
 }
 
-# The pinned bundle is MT8163 Wi-Fi firmware read from the stock system_a. A
-# Lidar image is MT8167: its stock system_a carries a different firmware set,
-# so this import cannot succeed there. Report not-applicable instead of a
-# failure, and leave the boot-health verdict untouched. An unreadable target
-# file keeps the old behaviour so a damaged identity fails closed elsewhere.
-vendor_import_applicable()
+# The importer selects the firmware family from the immutable image identity:
+# MT8163 WMT blobs on radar_puffin/biscuit and MT7668 SDIO blobs on Lidar.  An
+# unreadable target file keeps the MT8163 behaviour so a damaged identity fails
+# closed elsewhere rather than silently importing the wrong family.
+vendor_import_variant()
 {
+    VARIANT=mt8163
     vi_target=
     [ -f "$TARGET_FILE" ] && [ ! -L "$TARGET_FILE" ] || return 0
     vi_target=$(sed -n 's/^target_id=//p' "$TARGET_FILE" 2>/dev/null | head -n 1)
-    [ "$vi_target" != lidar ]
+    [ "$vi_target" = lidar ] && VARIANT=lidar
+    return 0
+}
+
+lidar_per_unit_target()
+{
+    case "$1" in
+        EEPROM_MT7668.bin|TxPwrLimit_MT76x8.dat|wifi.cfg) return 0 ;;
+    esac
+    return 1
+}
+
+# Calibration is programmed per unit and cannot be hash-pinned globally.  Accept
+# a regular file whose size matches the format: a fixed 1 KiB EEPROM image, a
+# bounded power table, and a bounded text configuration.
+lidar_per_unit_file_ok()
+{
+    [ -f "$2" ] && [ ! -L "$2" ] || return 1
+    per_unit_size=$(stat -c %s "$2")
+    case "$1" in
+        EEPROM_MT7668.bin) [ "$per_unit_size" -eq 1024 ] ;;
+        TxPwrLimit_MT76x8.dat)
+            [ "$per_unit_size" -ge 1 ] && [ "$per_unit_size" -le 1048576 ]
+            ;;
+        wifi.cfg) [ "$per_unit_size" -ge 1 ] && [ "$per_unit_size" -le 65536 ] ;;
+        *) return 1 ;;
+    esac
 }
 
 fail()
@@ -119,8 +154,77 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
+validate_lidar_spec_file()
+{
+    spec_path=$1
+    [ -f "$spec_path" ] && [ ! -L "$spec_path" ] || fail VENDOR_IMPORT_SPEC_MISSING
+    count=0
+    saw_ram=0
+    saw_cr4=0
+    saw_eeprom=0
+    saw_txpwr=0
+    saw_cfg=0
+    while IFS='|' read -r expected_hash expected_size source_name target_name; do
+        [ -n "$expected_hash" ] || continue
+        case "$source_name" in
+            system/vendor/firmware/*) ;;
+            *) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;;
+        esac
+        case "$source_name" in *..*|*//*|*/./*) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;; esac
+        [ "${source_name##*/}" = "$target_name" ] || fail VENDOR_IMPORT_SPEC_SOURCE_TARGET_MISMATCH
+        case "$target_name" in
+            WIFI_RAM_CODE_MT7668.bin)
+                [ "$saw_ram" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                [ "$expected_hash" = "$LIDAR_RAM_CODE_HASH" ] ||
+                    fail VENDOR_IMPORT_SPEC_HASH_INVALID
+                [ "$expected_size" = "$LIDAR_RAM_CODE_SIZE" ] ||
+                    fail VENDOR_IMPORT_SPEC_SIZE_INVALID
+                saw_ram=1
+                ;;
+            WIFI_RAM_CODE2_SDIO_MT7668.bin)
+                [ "$saw_cr4" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                [ "$expected_hash" = "$LIDAR_CR4_CODE_HASH" ] ||
+                    fail VENDOR_IMPORT_SPEC_HASH_INVALID
+                [ "$expected_size" = "$LIDAR_CR4_CODE_SIZE" ] ||
+                    fail VENDOR_IMPORT_SPEC_SIZE_INVALID
+                saw_cr4=1
+                ;;
+            EEPROM_MT7668.bin|TxPwrLimit_MT76x8.dat|wifi.cfg)
+                # The size is derived from the file's own sanity contract, not
+                # from a per-unit measurement, so an updated unit still imports.
+                [ "$expected_hash" = per-unit ] || fail VENDOR_IMPORT_SPEC_HASH_INVALID
+                [ "$expected_size" = - ] || fail VENDOR_IMPORT_SPEC_SIZE_INVALID
+                case "$target_name" in
+                    EEPROM_MT7668.bin)
+                        [ "$saw_eeprom" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                        saw_eeprom=1
+                        ;;
+                    TxPwrLimit_MT76x8.dat)
+                        [ "$saw_txpwr" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                        saw_txpwr=1
+                        ;;
+                    wifi.cfg)
+                        [ "$saw_cfg" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                        saw_cfg=1
+                        ;;
+                esac
+                ;;
+            *) fail VENDOR_IMPORT_SPEC_TARGET_INVALID ;;
+        esac
+        count=$((count + 1))
+    done < "$spec_path"
+    [ "$count" -eq 5 ] || fail VENDOR_IMPORT_SPEC_COUNT_INVALID
+    [ "$saw_ram" -eq 1 ] && [ "$saw_cr4" -eq 1 ] && \
+        [ "$saw_eeprom" -eq 1 ] && [ "$saw_txpwr" -eq 1 ] && \
+        [ "$saw_cfg" -eq 1 ] || fail VENDOR_IMPORT_SPEC_TARGET_SET_INVALID
+}
+
 validate_spec_file()
 {
+    if [ "$VARIANT" = lidar ]; then
+        validate_lidar_spec_file "$1"
+        return $?
+    fi
     spec_path=$1
     [ -f "$spec_path" ] && [ ! -L "$spec_path" ] || fail VENDOR_IMPORT_SPEC_MISSING
     count=0
@@ -241,8 +345,12 @@ layout_matches()
         candidate=$SOURCE_ROOT/$candidate_layout/$target_name
         [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
         if [ "$candidate_mode" = pinned ]; then
-            [ "$(stat -c %s "$candidate")" = "$expected_size" ] || return 1
-            [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$expected_hash" ] || return 1
+            if [ "$expected_hash" = per-unit ]; then
+                lidar_per_unit_file_ok "$target_name" "$candidate" || return 1
+            else
+                [ "$(stat -c %s "$candidate")" = "$expected_size" ] || return 1
+                [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$expected_hash" ] || return 1
+            fi
         else
             forced_file_is_compatible "$candidate" "$target_name" || return 1
         fi
@@ -253,6 +361,15 @@ layout_matches()
 try_shipped_specs()
 {
     candidate_layout=$1
+    if [ "$VARIANT" = lidar ]; then
+        validate_spec_file "$SPEC"
+        if layout_matches "$candidate_layout" pinned "$SPEC"; then
+            ACTIVE_SPEC=$SPEC
+            VERIFICATION=lidar-hash-pinned-ram-per-unit-calibration
+            return 0
+        fi
+        return 1
+    fi
     if [ -n "$SPEC_OVERRIDE" ]; then
         if layout_matches "$candidate_layout" pinned "$SPEC"; then
             ACTIVE_SPEC=$SPEC
@@ -282,7 +399,7 @@ select_source_layout()
     saw_symlink=0
     saw_safe_layout=0
     enrolled_present=0
-    if validate_enrolled_spec; then
+    if [ "$VARIANT" != lidar ] && validate_enrolled_spec; then
         enrolled_present=1
     fi
 
@@ -305,6 +422,16 @@ select_source_layout()
             [ "$layout_rc" -eq 2 ] && saw_symlink=1
         fi
     done
+
+    if [ "$VARIANT" = lidar ]; then
+        if [ "$saw_safe_layout" -eq 0 ] && [ "$saw_symlink" -eq 1 ]; then
+            fail VENDOR_IMPORT_SOURCE_PATH_SYMLINK
+        fi
+        # Lidar has no owner-local enrolment/force path: the two RAM codes are
+        # hash-pinned and the calibration set is bounded, so a stock partition
+        # that does not form the known set is a hard, visible failure.
+        fail VENDOR_IMPORT_LIDAR_SET_INVALID
+    fi
 
     if [ "$FORCE_REQUESTED" -eq 1 ]; then
         for candidate_layout in $SOURCE_LAYOUTS; do
@@ -361,12 +488,20 @@ verify_assets()
         target=$verify_root/$target_name
         [ -f "$target" ] && [ ! -L "$target" ] || return 1
         [ "$(stat -c %a "$target")" = 600 ] || return 1
-        [ "$(stat -c %s "$target")" = "$expected_size" ] || return 1
-        actual_hash=$(sha256sum "$target" | awk '{print $1}')
-        [ "$actual_hash" = "$expected_hash" ] || return 1
+        if [ "$expected_hash" = per-unit ]; then
+            lidar_per_unit_file_ok "$target_name" "$target" || return 1
+        else
+            [ "$(stat -c %s "$target")" = "$expected_size" ] || return 1
+            actual_hash=$(sha256sum "$target" | awk '{print $1}')
+            [ "$actual_hash" = "$expected_hash" ] || return 1
+        fi
         count=$((count + 1))
     done < "$ACTIVE_SPEC"
-    [ "$count" -eq 4 ] || return 1
+    if [ "$VARIANT" = lidar ]; then
+        [ "$count" -eq 5 ] || return 1
+    else
+        [ "$count" -eq 4 ] || return 1
+    fi
 
     for child in "$verify_root"/* "$verify_root"/.[!.]*; do
         [ -e "$child" ] || [ -L "$child" ] || continue
@@ -385,6 +520,22 @@ install_runtime_files()
         source=$STAGE/$target_name
         target=$FIRMWARE_ROOT/$target_name
         temp=$FIRMWARE_ROOT/.$target_name.import.$$
+        if [ "$expected_hash" = per-unit ]; then
+            # Calibration differs per unit.  Keep the strict file/mode checks
+            # but always publish the current stock copy: a repaired or
+            # re-provisioned unit must not keep a stale power table.
+            if [ -e "$target" ] || [ -L "$target" ]; then
+                [ -f "$target" ] && [ ! -L "$target" ] || fail VENDOR_IMPORT_RUNTIME_FILE_COLLISION
+                [ "$(stat -c %a "$target")" = 600 ] || fail VENDOR_IMPORT_RUNTIME_MODE_MISMATCH
+            fi
+            [ ! -e "$temp" ] && [ ! -L "$temp" ] || fail VENDOR_IMPORT_RUNTIME_FILE_COLLISION
+            cp "$source" "$temp"
+            chmod 0600 "$temp"
+            lidar_per_unit_file_ok "$target_name" "$temp" || \
+                fail VENDOR_IMPORT_RUNTIME_SIZE_MISMATCH
+            mv "$temp" "$target"
+            continue
+        fi
         if [ -e "$target" ] || [ -L "$target" ]; then
             [ -f "$target" ] && [ ! -L "$target" ] || fail VENDOR_IMPORT_RUNTIME_FILE_COLLISION
             [ "$(stat -c %a "$target")" = 600 ] || fail VENDOR_IMPORT_RUNTIME_MODE_MISMATCH
@@ -402,6 +553,11 @@ install_runtime_files()
         mv "$temp" "$target"
     done < "$ACTIVE_SPEC"
 
+    # MT8163's driver asks for the bare WIFI_RAM_CODE; the MT7668 driver asks
+    # for its chip-qualified names and needs no alias.
+    if [ "$VARIANT" = lidar ]; then
+        return 0
+    fi
     wifi_source=$STAGE/WIFI_RAM_CODE_8163
     wifi_hash=$(grep '|WIFI_RAM_CODE_8163$' "$ACTIVE_SPEC" | cut -d '|' -f 1)
     wifi_size=$(grep '|WIFI_RAM_CODE_8163$' "$ACTIVE_SPEC" | cut -d '|' -f 2)
@@ -456,14 +612,13 @@ enrol_for_future_boots()
     sync || fail VENDOR_IMPORT_ENROLLED_SPEC_SYNC_FAILED
 }
 
-prepare_status_path || fail VENDOR_IMPORT_STATUS_PATH_UNSAFE
-if ! vendor_import_applicable; then
-    STATUS_STATE=not-applicable
-    STATUS_ERROR=target-mt8167-no-mt8163-firmware
-    write_status
-    printf 'VENDOR_IMPORT_NOT_APPLICABLE target=lidar\n'
-    exit 0
+vendor_import_variant
+if [ "$VARIANT" = lidar ]; then
+    BUNDLE_ID=$LIDAR_BUNDLE_ID
+    SPEC=${SPEC_OVERRIDE:-$SPEC_DIR/$BUNDLE_ID.tsv}
+    ACTIVE_SPEC=$SPEC
 fi
+prepare_status_path || fail VENDOR_IMPORT_STATUS_PATH_UNSAFE
 validate_spec_file "$SPEC"
 write_status
 
@@ -488,7 +643,8 @@ else
     [ -n "$SOURCE_ROOT" ] || fail VENDOR_IMPORT_TEST_SOURCE_MISSING
 fi
 
-if [ -e "$FORCE_MARKER" ] || [ -L "$FORCE_MARKER" ]; then
+if [ "$VARIANT" != lidar ] && \
+        { [ -e "$FORCE_MARKER" ] || [ -L "$FORCE_MARKER" ]; }; then
     [ -f "$FORCE_MARKER" ] && [ ! -L "$FORCE_MARKER" ] || fail VENDOR_IMPORT_FORCE_MARKER_INVALID
     [ "$(stat -c %a "$FORCE_MARKER")" = 600 ] || fail VENDOR_IMPORT_FORCE_MARKER_MODE_INVALID
     [ "$(cat "$FORCE_MARKER")" = force-unverified-owner-local-import-v1 ] || \
@@ -534,13 +690,22 @@ while IFS='|' read -r expected_hash expected_size source_name target_name; do
     source=$SOURCE_ROOT/$SELECTED_LAYOUT/$target_name
     target=$STAGE/$target_name
     [ -f "$source" ] && [ ! -L "$source" ] || fail VENDOR_IMPORT_SOURCE_FILE_MISSING
-    [ "$(stat -c %s "$source")" = "$expected_size" ] || fail VENDOR_IMPORT_SOURCE_SIZE_MISMATCH
-    actual_hash=$(sha256sum "$source" | awk '{print $1}')
-    [ "$actual_hash" = "$expected_hash" ] || fail VENDOR_IMPORT_SOURCE_HASH_MISMATCH
-    cp "$source" "$target"
-    chmod 0600 "$target"
-    [ "$(sha256sum "$target" | awk '{print $1}')" = "$expected_hash" ] || \
-        fail VENDOR_IMPORT_COPY_HASH_MISMATCH
+    if [ "$expected_hash" = per-unit ]; then
+        lidar_per_unit_file_ok "$target_name" "$source" || \
+            fail VENDOR_IMPORT_SOURCE_SIZE_MISMATCH
+        cp "$source" "$target"
+        chmod 0600 "$target"
+        lidar_per_unit_file_ok "$target_name" "$target" || \
+            fail VENDOR_IMPORT_COPY_SIZE_MISMATCH
+    else
+        [ "$(stat -c %s "$source")" = "$expected_size" ] || fail VENDOR_IMPORT_SOURCE_SIZE_MISMATCH
+        actual_hash=$(sha256sum "$source" | awk '{print $1}')
+        [ "$actual_hash" = "$expected_hash" ] || fail VENDOR_IMPORT_SOURCE_HASH_MISMATCH
+        cp "$source" "$target"
+        chmod 0600 "$target"
+        [ "$(sha256sum "$target" | awk '{print $1}')" = "$expected_hash" ] || \
+            fail VENDOR_IMPORT_COPY_HASH_MISMATCH
+    fi
 done < "$ACTIVE_SPEC"
 if [ "$ACTIVE_SPEC" != "$STAGE/ASSETS.tsv" ]; then
     cp "$ACTIVE_SPEC" "$STAGE/ASSETS.tsv"
@@ -550,6 +715,14 @@ verify_assets "$STAGE" || fail VENDOR_IMPORT_STAGE_INVALID
 install_runtime_files
 enrol_for_future_boots
 sync
+if [ "$VARIANT" = lidar ]; then
+    STATUS_STATE=imported
+    STATUS_ERROR=none
+    write_status
+    printf 'VENDOR_IMPORT_LIDAR_INSTALLED verification=%s source_layout=%s\n' \
+        "$VERIFICATION" "$SELECTED_LAYOUT"
+    exit 0
+fi
 STATUS_STATE=ready
 STATUS_ERROR=none
 write_status

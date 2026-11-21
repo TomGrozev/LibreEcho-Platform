@@ -78,6 +78,35 @@ For the MT8163 WLAN driver, the importer creates the runtime regular-file alias
 to `../lib/firmware`, matching the driver's literal firmware path without
 embedding or redistributing vendor bytes.
 
+## Lidar MT7668 layout
+
+`lidar-mt7668-stock-v1.tsv` is selected from `/etc/libreecho/target`
+(`target_id=lidar`). It reads the same bounded `system/vendor/firmware` layout
+from the same read-only `system_a` mount.
+
+The two RAM codes are hash- and size-pinned:
+
+| target | bytes | SHA-256 |
+| --- | --- | --- |
+| `WIFI_RAM_CODE_MT7668.bin` | 459528 | `9240c5182c89bdd98bda2655e01053ef8ea06afd45d61cf6ada3f11d65956e7d` |
+| `WIFI_RAM_CODE2_SDIO_MT7668.bin` | 51816 | `35faff6a613fefcbe33a6f6d8df885be76c546f9e78ba8ab93056a816ad87254` |
+
+`EEPROM_MT7668.bin` (1024 bytes), `TxPwrLimit_MT76x8.dat` (at most 1 MiB) and
+`wifi.cfg` (at most 64 KiB) contain per-unit calibration and MAC data, so they
+are marked `per-unit` and checked by size only. They are replaced atomically on
+every boot, so a repaired or re-provisioned unit does not keep a stale table.
+
+The importer does not copy the Fire OS ROM patch. Lidar images ship the
+redistributable linux-firmware `mediatek/mt7668pr2h.bin` under the names the two
+drivers request (`lib/firmware/mt7668_patch_e2_hdr.bin` for WLAN and
+`lib/firmware/mediatek/mt7668pr2h.bin` for Bluetooth), pinned by the image
+builder and verifier. A Fire OS patch revision would either collide with the
+verified blob or replace it with an unlicensed one.
+
+A Lidar run publishes `state=imported`. It has no force/enrolment path: a stock
+partition that does not form the known RAM-code set fails with
+`VENDOR_IMPORT_LIDAR_SET_INVALID`.
+
 ## Enrolment durability and reboot regression (0.13.18)
 
 Before publishing a new owner-local contract, the importer compares the temporary
