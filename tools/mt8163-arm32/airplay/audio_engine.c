@@ -75,6 +75,10 @@
 #define WIDE_PERIOD_SIZE 1024U
 #define WIDE_PERIOD_COUNT 3U
 #define AMP_SETTLE_US 30000U
+/* How long a drained Lidar session keeps its settled output: covers the gap to
+ * the next reply (esphomed's wake-time silence starts the session) without
+ * holding amplifier power and PCM 0,0 through a quiet room. */
+#define LIDAR_OUTPUT_HOLD_US 30000000LL
 /* Poll slice of the bounded end-of-session drain; see drain_output_pcm(). */
 #define OUTPUT_DRAIN_SLICE_US 5000U
 #define SOURCE_COUNT 5U
@@ -3148,6 +3152,40 @@ static void drain_output_pcm(struct pcm *pcm)
 	}
 }
 
+/*
+ * Leave the Lidar output stage powered but silent.
+ *
+ * The kernel machine driver pays a 500 ms amplifier settle inside the DAPM
+ * power-up that pcm_prepare() triggers (mt8516-amazon-lidar.c,
+ * LIDAR_AMP_SETTLE_MS).  The settle protects the amplifier's own power-on
+ * transient, so it cannot be shortened, but it only has to happen when the
+ * amplifier switches on.  Closing the PCM between sessions powers the DAC and
+ * the amplifier down, and the next reply then opens them cold: every voice
+ * turn paid the settle before its first sample.  Re-preparing the PCM and
+ * muting the DAC keeps the amplifier settled, so a later session's
+ * pcm_prepare() is a plain DMA reset.
+ *
+ * Only the DAC is muted here.  "Output Route" stays on Speaker on purpose:
+ * routing to Line Out is what powers the amplifier down.
+ */
+static int lidar_hold_output_pcm(unsigned int card, struct pcm *pcm)
+{
+	struct mixer *mixer;
+
+	if (!pcm || !pcm_is_ready(pcm))
+		return -1;
+	mixer = mixer_open(card);
+	if (!mixer)
+		return -1;
+	if (set_stereo_control(mixer, "LO DAC Playback Switch", 0) < 0) {
+		mixer_close(mixer);
+		return -1;
+	}
+	mixer_close(mixer);
+	/* Clears a drained stream's XRUN so the next write starts cleanly. */
+	return pcm_prepare(pcm) < 0 ? -1 : 0;
+}
+
 static int run_engine(const char *root, unsigned int card, unsigned int device)
 {
 	struct pcm_config config = {
@@ -3170,6 +3208,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	struct playback_status status;
 	struct le_aec_reference_sender reference;
 	int16_t *output = NULL;
+	/* Held across sessions on the Lidar chain; see lidar_hold_output_pcm(). */
+	struct pcm *pcm = NULL;
+	long long hold_until_us = 0;
 	int result = -1;
 	int announcement_led_active = 0;
 	int32_t master_gain = 0;
@@ -3274,11 +3315,19 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		avl_disable_path[0] ? avl_disable_path : "unavailable");
 
 	while (!stopping) {
-		struct pcm *pcm = NULL;
 		unsigned int first_activity;
 		uint64_t start_began_ns = 0;
 		int ready;
 		int poll_timeout = 20; /* service resets even when all buses are idle */
+
+		/* End a Lidar hold: the window is over, so let the amplifier down
+		 * through the normal route/close teardown. */
+		if (pcm && hold_until_us != 0 && sendspin_now_us() >= hold_until_us) {
+			hold_until_us = 0;
+			(void)disable_output_controls(card);
+			pcm_close(pcm);
+			pcm = NULL;
+		}
 
 		/* Idle snapshot, taken before the wait: its FIFO counter and queue
 		 * are a consistent pair, and the poll bounds its age to one tick. */
@@ -3336,28 +3385,31 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		start_began_ns = le_ad_now_ns();
 		g_output_start_due_ns = start_began_ns + g_output_start_est_ns;
 		airplay_delay_publish(NULL, sources);
-		if (arm_output_controls(card) < 0) {
-			fprintf(stderr, "audio-engine: output arm failed\n");
-			g_output_start_due_ns = 0;
-			clear_source_activity(sources, &announcement_led_active,
-					      &visualizer, &status);
-			continue;
-		}
-		SENDSPIN_TRACE("s-armed");
-		airplay_delay_publish(NULL, sources);
-		pcm = open_output_pcm(card, device, &config);
-		if (!pcm || !pcm_is_ready(pcm)) {
-			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
-				card, device,
-				pcm ? pcm_get_error(pcm) : "open failed");
-			g_output_start_due_ns = 0;
-			if (pcm)
-				pcm_close(pcm);
-			(void)disable_output_controls(card);
-			clear_source_activity(sources, &announcement_led_active,
-					      &visualizer, &status);
-			usleep(250000);
-			continue;
+		if (!pcm) {
+			if (arm_output_controls(card) < 0) {
+				fprintf(stderr, "audio-engine: output arm failed\n");
+				g_output_start_due_ns = 0;
+				clear_source_activity(sources, &announcement_led_active,
+						      &visualizer, &status);
+				continue;
+			}
+			SENDSPIN_TRACE("s-armed");
+			airplay_delay_publish(NULL, sources);
+			pcm = open_output_pcm(card, device, &config);
+			if (!pcm || !pcm_is_ready(pcm)) {
+				fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
+					card, device,
+					pcm ? pcm_get_error(pcm) : "open failed");
+				g_output_start_due_ns = 0;
+				if (pcm)
+					pcm_close(pcm);
+				pcm = NULL;
+				(void)disable_output_controls(card);
+				clear_source_activity(sources, &announcement_led_active,
+						      &visualizer, &status);
+				usleep(250000);
+				continue;
+			}
 		}
 		/* A fresh PCM has an empty ring: a boundary seen before the open
 		 * has nothing to drop, and one seen after it is a new event. */
@@ -3387,6 +3439,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		/* The codec stays at its safe fixed reference; software owns gain. */
 		int playback_start_failed = 0;
+		int session_failed = 0;
 		SENDSPIN_TRACE("s-opened");
 		airplay_delay_publish(NULL, sources);
 
@@ -3431,6 +3484,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			sendspin_close_timing(&g_sendspin);
 			(void)disable_output_controls(card);
 			pcm_close(pcm);
+			pcm = NULL;
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -3497,6 +3551,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				fprintf(stderr,
 					"audio-engine: PCM write failed: %s\n",
 					pcm_get_error(pcm));
+				session_failed = 1;
 				break;
 			}
 			if (g_sendspin.have_generation) {
@@ -3556,11 +3611,28 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
 		sendspin_close_timing(&g_sendspin);
-		(void)disable_output_controls(card);
-		pcm_close(pcm);
+		/* Lidar keeps a prepared, muted output for a bounded window so the
+		 * next reply does not pay the kernel's amplifier settle.  An XRUN
+		 * teardown is not held: the failed PCM is closed and the next session
+		 * reopens it.  MT8163 is unchanged. */
+		if (speaker_profile.lidar_chain && !session_failed && !stopping &&
+		    lidar_hold_output_pcm(card, pcm) == 0) {
+			hold_until_us = sendspin_now_us() + LIDAR_OUTPUT_HOLD_US;
+			SENDSPIN_TRACE("s-held");
+		} else {
+			hold_until_us = 0;
+			(void)disable_output_controls(card);
+			pcm_close(pcm);
+			pcm = NULL;
+		}
 	}
 	result = stopping ? 0 : -1;
 out:
+	if (pcm) {
+		(void)disable_output_controls(card);
+		pcm_close(pcm);
+		pcm = NULL;
+	}
 	stop_music_visualizer(&visualizer);
 	if (announcement_led_active)
 		set_announcement_led(0);
