@@ -496,6 +496,28 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, Any], target: str,
     elif expected.get('wpa_supplicant') is not None:
         fail('a wpa_supplicant pin was given but the image stages none')
 
+    audio_tools = manifest.get('audio_tools')
+    if audio_tools is not None:
+        if not isinstance(audio_tools, dict):
+            fail('manifest has a malformed audio_tools record')
+        for name in ('tinyplay', 'tinycap', 'tinymix'):
+            record = audio_tools.get(name)
+            if not isinstance(record, dict):
+                fail(f'manifest lacks the audio tool record for {name}')
+            pin = expected.get(name)
+            digest = str(record.get('sha256'))
+            if pin is not None and digest != pin:
+                fail(f'{name} hash differs from the caller pin')
+            entry = require_member(entries, f'sbin/{name}', digest, 0o755)
+            if record.get('size') != len(entry.data):
+                fail(f'{name} size differs from the manifest')
+            info = shared.elf_info(entry.data)
+            if info != (1, 40, 0x05000400, None, (), False):
+                fail(f'{name} is not a static ARM32 hard-float executable: {info!r}')
+    elif any(expected.get(name) is not None
+             for name in ('tinyplay', 'tinycap', 'tinymix')):
+        fail('an audio tool pin was given but the image stages none')
+
     validate_thread(entries, manifest)
 
     for relative, text in (
@@ -737,6 +759,12 @@ def main() -> None:
                              'the boot-contained discovery runtime is staged')
     parser.add_argument('--expected-wpa-supplicant-sha256',
                         help='require this staged static ARM32 wpa_supplicant')
+    parser.add_argument('--expected-tinyplay-sha256',
+                        help='require this staged static ARM32 tinyplay')
+    parser.add_argument('--expected-tinycap-sha256',
+                        help='require this staged static ARM32 tinycap')
+    parser.add_argument('--expected-tinymix-sha256',
+                        help='require this staged static ARM32 tinymix')
     parser.add_argument('--image-profile', choices=('development', 'ota'), required=True)
     parser.add_argument('--service-profile', choices=('diagnostic', 'production'),
                         required=True)
@@ -765,6 +793,9 @@ def main() -> None:
         'feature_policy': args.feature_policy,
         'update_channel': args.update_channel,
         'wpa_supplicant': args.expected_wpa_supplicant_sha256,
+        'tinyplay': args.expected_tinyplay_sha256,
+        'tinycap': args.expected_tinycap_sha256,
+        'tinymix': args.expected_tinymix_sha256,
         'stock_collection': args.expected_stock_dtb_collection_sha256,
         'stock_pvt': args.expected_stock_pvt_sha256,
     }

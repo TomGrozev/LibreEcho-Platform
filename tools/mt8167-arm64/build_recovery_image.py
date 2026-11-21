@@ -689,6 +689,29 @@ def add_lidar_network(stage: Path, manifest: dict[str, object],
     }
 
 
+def add_lidar_audio_tools(stage: Path, manifest: dict[str, object],
+                          tools: dict[str, Path]) -> None:
+    """Stage the static tinyalsa utilities the mic path executes.
+
+    micd captures through /sbin/tinycap and the UI uses tinyplay/tinymix, so
+    the same pinned ARM32 musl build the MT8163 profile uses is staged here.
+    """
+    records: dict[str, object] = {}
+    for name, source in tools.items():
+        if source.is_symlink() or not source.is_file():
+            raise BuildError(f'{name} is not a regular file: {source}')
+        data = read(source)
+        relative = f'sbin/{name}'
+        destination = stage / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        destination.chmod(0o755)
+        elf = shared.require_elf_contract(destination, 0x05000400, None, (), False)
+        records[name] = {'sha256': sha256(data), 'size': len(data),
+                         'path': '/' + relative, 'elf': elf}
+    manifest['audio_tools'] = records
+
+
 def validate_ui_and_mdns_inputs(args: argparse.Namespace) -> bool:
     """Apply the shared UI and discovery input rules; return whether UI is staged."""
     ui_options = {
@@ -780,6 +803,12 @@ def main() -> None:
                         help='user-mode ARM emulator used to inventory BusyBox applets')
     parser.add_argument('--wpa-supplicant', type=Path,
                         help='staged static ARM32 wpa_supplicant for the WLAN client')
+    parser.add_argument('--tinyplay', type=Path,
+                        help='staged static ARM32 tinyplay')
+    parser.add_argument('--tinycap', type=Path,
+                        help='staged static ARM32 tinycap')
+    parser.add_argument('--tinymix', type=Path,
+                        help='staged static ARM32 tinymix')
     parser.add_argument('--audio-probe', type=Path,
                         help='MT8163-only optional payload; refused for lidar')
     parser.add_argument('--wifi-dtb', type=Path,
@@ -881,6 +910,14 @@ def main() -> None:
                                 args.wifi_licence.resolve())
         if args.wpa_supplicant is not None:
             add_lidar_network(stage, manifest, args.wpa_supplicant.resolve())
+        audio_labels = ('tinyplay', 'tinycap', 'tinymix')
+        audio_paths = [getattr(args, name) for name in audio_labels]
+        if any(path is not None for path in audio_paths):
+            if not all(path is not None for path in audio_paths):
+                raise BuildError('tinyplay, tinycap and tinymix must be given together')
+            add_lidar_audio_tools(stage, manifest,
+                                  {name: path.resolve()
+                                   for name, path in zip(audio_labels, audio_paths)})
         if ui_enabled:
             shared.add_ui_bundle(
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),
