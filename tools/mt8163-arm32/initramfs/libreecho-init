@@ -418,6 +418,14 @@ persist_failure_log()
     name=failure-$epoch-$$.log
     target=$FAILURE_LOG_DIR/$name
     tmp=$FAILURE_LOG_DIR/.$name.tmp
+    # This device has no RTC: every boot starts at 1970, so records written by
+    # different boots share (or go backwards in) mtime and `ls -t` cannot
+    # order them.  Pruning after the write let that arbitrary order delete the
+    # record this boot had just written.  Make room before writing instead: the
+    # newest record is then never a deletion candidate.
+    $BB ls -1dt "$FAILURE_LOG_DIR"/failure-*.log 2>/dev/null |
+        $BB tail -n "+$FAILURE_LOG_KEEP" |
+        while read -r stale; do $BB rm -f "$stale" 2>/dev/null || true; done
     # Cap the free-form detail well below the record budget, so the identity
     # and readback that make the snapshot useful survive truncation.
     detail_limit=$((FAILURE_LOG_MAX_BYTES / 4))
@@ -457,9 +465,6 @@ persist_failure_log()
     $BB chmod 0600 "$tmp" 2>/dev/null || true
     $BB mv "$tmp" "$target" 2>/dev/null || { $BB rm -f "$tmp"; return 0; }
     $BB sync 2>/dev/null || true
-    $BB ls -1dt "$FAILURE_LOG_DIR"/failure-*.log 2>/dev/null |
-        $BB tail -n "+$((FAILURE_LOG_KEEP + 1))" |
-        while read -r stale; do $BB rm -f "$stale" 2>/dev/null || true; done
     printf '%s\n' "$name"
     return 0
 }

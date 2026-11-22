@@ -476,6 +476,44 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
             self.assertIn("selected_slot=b", record)
             self.assertIn("slot_a_tries=0", record)
 
+    def test_failure_retention_keeps_the_record_this_boot_wrote(self) -> None:
+        """No RTC: every boot starts at 1970, so mtime cannot order records.
+
+        Seeded records carry a newer mtime than the one this run writes, which
+        is exactly what a reset clock produces.  Pruning must therefore happen
+        before the write; otherwise `ls -t` deletes the new record at once.
+        """
+        busybox = shutil.which("busybox") or "busybox"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "update"
+            outdir.mkdir()
+            for name in ("failure-229-1.log", "failure-235-1.log",
+                         "failure-236-1.log"):
+                (outdir / name).write_text("old\n")
+                # Newer than "now": the record written by this run sorts last.
+                os.utime(outdir / name, (2_000_000_000, 2_000_000_000))
+            script = (
+                f"BB={shlex.quote(busybox)}\n"
+                f"FAILURE_LOG_DIR={shlex.quote(str(outdir))}\n"
+                f"INIT_LOG={shlex.quote(str(root / 'init.log'))}\n"
+                f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(root / 'absent-cmdline'))}\n"
+                "LIBREECHO_BOOTCTL_TOOL=" + shlex.quote(str(root / "absent-bootctl")) + "\n"
+                + shell_function(self.init, "sanitize_failure_text")
+                + shell_function(self.init, "persist_failure_log")
+                + "persist_failure_log ota-health-confirm-failed detail\n"
+            )
+            result = subprocess.run(
+                [busybox, "sh", "-c", script], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            written = outdir / result.stdout.strip()
+            self.assertTrue(written.is_file(), result.stdout)
+            records = sorted(p.name for p in outdir.glob("failure-*.log"))
+            self.assertEqual(len(records), 3)
+            self.assertIn(written.name, records)
+            self.assertIn("reason=ota-health-confirm-failed", written.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
