@@ -535,8 +535,9 @@ class RadarTreeDiffTests(unittest.TestCase):
     # the authenticated generation mount, not the legacy v2 tree. Its staged
     # bytes are pinned to that exact reviewed commit instead of ESPHome's.
     # Re-reviewed again for 0.14.6 (Platform #322): Home Assistant voice mode
-    # keeps ttsd, so reminders and the announce action can speak.
-    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': 'd71439068144a110d518ff2f0f8d2dfe7a8234a0'}
+    # keeps ttsd, so reminders and the announce action can speak. Its staged
+    # bytes are pinned to that reviewed commit.
+    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '7661bc23f'}
 
     @staticmethod
     def tree(stage):
@@ -653,8 +654,9 @@ class RadarTreeDiffTests(unittest.TestCase):
             # OTA v3 moved feature payload mounting to the generation. The
             # reviewed v3 startup contract is pinned to its exact source.
             # The saved-SSH-switch change (activation contract and persistent
-            # host key) edits add_ssh_bundle; pin its reviewed source too.
-            v3_reviewed = {'validate_ui_startup_contract': '8dd95bb9682fe8ddddc2f746a875354b76bb19af2bbefbcc2818d618ed0e18de',
+            # host key) edits add_ssh_bundle; pin its reviewed source too. The
+            # startup contract was re-reviewed for the voice and ESPHome gates.
+            v3_reviewed = {'validate_ui_startup_contract': 'e780a625354ee84aaff5632937b445509da0e2c7abc87a19649be059276116ab',
                            'add_ssh_bundle': 'b82b051f1e05d650aa5ac9387c7f1ed46b14e0ca3db86b7b1083382b57a976c1'}
             for name, digest in v3_reviewed.items():
                 self.assertEqual(hashlib.sha256(new_functions[name].encode()).hexdigest(), digest, name)

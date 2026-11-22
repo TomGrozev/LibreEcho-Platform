@@ -2141,7 +2141,7 @@ class PolicyTests(unittest.TestCase):
         )) + "\n"
         valid_web = "\n".join((
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
-            "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+            "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-30}",
             "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
             "bluetooth_integration_state() {",
             "    printf 'disabled\\n'",
@@ -2155,6 +2155,31 @@ class PolicyTests(unittest.TestCase):
             "}",
             "airplay_integration_state() {",
             "    printf 'disabled\\n'",
+            "}",
+            "voice_services() {",
+            "    printf '%s\\n' sttd ttsd agentd",
+            "}",
+            "voice_sockets() {",
+            "    printf '%s\\n' stt tts agent",
+            "}",
+            "assistant_services() {",
+            "    printf '%s\\n' sttd agentd",
+            "}",
+            "service_alive() {",
+            "    pidfile=\"/var/run/libreecho-$1.pid\"",
+            "    [ -s \"$pidfile\" ] || return 1",
+            "    pid=$(sed -n '1p' \"$pidfile\")",
+            "    case \"$pid\" in *[!0-9]*|'') return 1 ;; esac",
+            "    kill -0 \"$pid\" 2>/dev/null",
+            "}",
+            "esphome_integration_state() {",
+            "    printf 'disabled\\n'",
+            "}",
+            "esphome_service_ready() {",
+            "    case \"$(esphome_integration_state)\" in",
+            "        disabled) return 0 ;;",
+            "        *) return 1 ;;",
+            "    esac",
             "}",
             "startup_services_ready() {",
             "    for socket in network audio mic led; do",
@@ -2177,9 +2202,26 @@ class PolicyTests(unittest.TestCase):
             "            ;;",
             "        *) return 1 ;;",
             "    esac",
+            "    assistant_running=0",
+            "    for service in $(assistant_services); do",
+            '        if service_alive "$service"; then assistant_running=1; fi',
+            "    done",
+            '    if [ "$assistant_running" -eq 1 ]; then',
+            "        for service in $(voice_services); do",
+            '            service_alive "$service" || return 1',
+            "        done",
+            "        for socket in $(voice_sockets); do",
+            '            [ -S "/run/libreecho/$socket.sock" ] || return 1',
+            "        done",
+            "    fi",
+            "    if [ -s /var/run/libreecho-ttsd.pid ]; then",
+            "        service_alive ttsd || return 1",
+            '        [ -S /run/libreecho/tts.sock ] || return 1',
+            "    fi",
+            "    esphome_service_ready",
             "}",
             "mark_startup_ready() {",
-            "    count=0",
+            "    delay=1",
             "    while :; do",
             "        if startup_services_ready; then",
             '            tmp="$STARTUP_READY.tmp"',
@@ -2187,9 +2229,9 @@ class PolicyTests(unittest.TestCase):
             '            mv -f "$tmp" "$STARTUP_READY"',
             "            return 0",
             "        fi",
-            "        sleep 0.1",
-            "        count=$((count + 1))",
-            '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+            '        sleep "$delay"',
+            "        delay=$((delay * 2))",
+            '        [ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY',
             "    done",
             "}",
             "start_service() { :; }",
@@ -2285,18 +2327,18 @@ class PolicyTests(unittest.TestCase):
 
             one_shot_web = valid_web
             for marker in (
-                "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}\n",
+                "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-30}\n",
                 "    while :; do\n",
-                "        sleep 0.1\n",
-                "        count=$((count + 1))\n",
-                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+                '        sleep "$delay"\n',
+                "        delay=$((delay * 2))\n",
+                '        [ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY\n',
             ):
                 one_shot_web = one_shot_web.replace(marker, "")
             loop_done = one_shot_web.rfind("    done\n")
             self.assertGreater(loop_done, -1)
             one_shot_web = one_shot_web[:loop_done] + one_shot_web[loop_done + len("    done\n"):]
             web.write_text(one_shot_web)
-            with self.assertRaisesRegex(SystemExit, "STARTUP_READY_TIMEOUT_TICKS"):
+            with self.assertRaisesRegex(SystemExit, "STARTUP_READY_MAX_DELAY"):
                 builder.validate_ui_startup_contract(bundle)
             web.write_text(valid_web)
 
@@ -2314,9 +2356,9 @@ class PolicyTests(unittest.TestCase):
             web.write_text(valid_web)
 
             malformed_web = valid_web.replace(
-                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n'
+                '        [ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY\n'
                 "    done\n",
-                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+                '        [ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY\n',
             )
             web.write_text(malformed_web)
             with self.assertRaisesRegex(SystemExit, "invalid shell syntax"):

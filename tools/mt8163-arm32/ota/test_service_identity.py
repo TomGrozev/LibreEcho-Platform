@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'initramfs/libreecho-generation-transaction'
+BUSYBOX = shutil.which('busybox') or BUSYBOX
 
 class ServiceIdentity(unittest.TestCase):
     def probe(self, engine=True, corrupt=False, controller_bad=False, wrong_path=False, feature='airplay2'):
@@ -18,11 +19,11 @@ class ServiceIdentity(unittest.TestCase):
             run, var = root / 'run', root / 'var'
             var.mkdir(); (run / 'libreecho').mkdir(parents=True)
             controller = root / 'libreecho-airplayd'
-            shutil.copyfile('/bin/busybox', controller); controller.chmod(0o755)
+            shutil.copyfile(BUSYBOX, controller); controller.chmod(0o755)
             name = 'libreecho-audio-engine' if feature == 'airplay2' else 'libreecho-ttsd'
             binary = run / f'libreecho/features/{feature}/root/usr/local/sbin/{name}'
             binary.parent.mkdir(parents=True)
-            shutil.copyfile('/bin/busybox', binary); binary.chmod(0o755)
+            shutil.copyfile(BUSYBOX, binary); binary.chmod(0o755)
             expected = hashlib.sha256(binary.read_bytes()).hexdigest()
             processes = []
             def child(path):
@@ -33,13 +34,13 @@ class ServiceIdentity(unittest.TestCase):
                 path = controller if feature == 'airplay2' else binary
                 if controller_bad or wrong_path:
                     path = root / 'unrelated'
-                    shutil.copyfile('/bin/busybox', path); path.chmod(0o755)
+                    shutil.copyfile(BUSYBOX, path); path.chmod(0o755)
                 owner = child(path)
                 if feature == 'airplay2' and engine:
                     engine_path = binary
                     if wrong_path:
                         engine_path = root / 'unrelated-engine'
-                        shutil.copyfile('/bin/busybox', engine_path); engine_path.chmod(0o755)
+                        shutil.copyfile(BUSYBOX, engine_path); engine_path.chmod(0o755)
                     child(engine_path)
                 service = 'airplayd' if feature == 'airplay2' else 'ttsd'
                 (var / f'libreecho-{service}.pid').write_text(f'{owner.pid}\n')
@@ -51,9 +52,9 @@ class ServiceIdentity(unittest.TestCase):
                     sock.bind(str(sockpath))
                     text = SOURCE.read_text().split('# Observation commands')[0]
                     text = text.replace('/usr/local/sbin/libreecho-airplayd', str(controller))
-                    for key, val in dict(PROC_ROOT='/proc', RUN_ROOT=run, VAR_RUN_ROOT=var, PROC_NET_UNIX='/proc/net/unix', MANIFEST=manifest).items():
+                    for key, val in dict(BB=BUSYBOX, PROC_ROOT='/proc', RUN_ROOT=run, VAR_RUN_ROOT=var, PROC_NET_UNIX='/proc/net/unix', MANIFEST=manifest).items():
                         text += f'\n{key}={shlex.quote(str(val))}\n'
-                    return subprocess.run(['/bin/busybox', 'sh'], input=text + f'\nservice_probe {feature}\n', text=True, capture_output=True)
+                    return subprocess.run([BUSYBOX, 'sh'], input=text + f'\nservice_probe {feature}\n', text=True, capture_output=True)
             finally:
                 for p in processes: p.terminate(); p.wait()
 

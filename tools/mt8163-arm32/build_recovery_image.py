@@ -61,7 +61,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "38e4321375bb1b09375b85d9689e1511988677084366a40d4304136ee7abe16e"
+RECOVERY_INIT_SHA256 = "ae84a0445533880ced096acef97d3f055bbe4c0ef23f2d5149c9a2845e0f3077"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -1163,11 +1163,15 @@ def validate_ui_startup_contract(bundle: Path) -> None:
         (
             "etc/init.d/libreecho-web.init",
             (
-                "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+                "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-30}",
                 "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
                 "bluetooth_integration_state()",
                 "bluetooth_ready()",
                 "airplay_integration_state()",
+                "voice_services()",
+                "voice_sockets()",
+                "assistant_services()",
+                "service_alive()",
                 "startup_services_ready()",
                 "for socket in network audio mic led; do",
                 "case \"$(airplay_integration_state)\" in",
@@ -1178,15 +1182,23 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 "enabled)",
                 '[ -f "$BT_READY_PATH" ]',
                 "mark_startup_ready()",
-                "count=0",
+                "delay=1",
                 "while :; do",
                 "if startup_services_ready; then",
                 'tmp="$STARTUP_READY.tmp"',
                 "printf 'schema=1\\n' >\"$tmp\"",
                 'mv -f "$tmp" "$STARTUP_READY"',
-                "sleep 0.1",
-                "count=$((count + 1))",
-                '[ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+                'sleep "$delay"',
+                "delay=$((delay * 2))",
+                '[ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY',
+                "assistant_running=0",
+                "for service in $(assistant_services); do",
+                "for service in $(voice_services); do",
+                "for socket in $(voice_sockets); do",
+                'if [ "$assistant_running" -eq 1 ]; then',
+                "esphome_integration_state()",
+                "esphome_service_ready()",
+                "disabled) return 0 ;;",
                 '[ -S "/run/libreecho/$socket.sock" ] || return 1',
                 "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
             ),
@@ -1293,15 +1305,15 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             readiness_body = text[readiness_start:dispatch_start]
             ordered = (
                 "mark_startup_ready()",
-                "count=0",
+                "delay=1",
                 "while :; do",
                 "if startup_services_ready; then",
                 'tmp="$STARTUP_READY.tmp"',
                 "printf 'schema=1\\n' >\"$tmp\"",
                 'mv -f "$tmp" "$STARTUP_READY"',
-                "sleep 0.1",
-                "count=$((count + 1))",
-                '[ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+                'sleep "$delay"',
+                "delay=$((delay * 2))",
+                '[ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY',
             )
             positions = [readiness_body.index(marker) for marker in ordered]
             if positions != sorted(positions):

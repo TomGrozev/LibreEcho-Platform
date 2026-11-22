@@ -421,7 +421,7 @@ persist_failure_log()
     name=failure-$epoch-$$.log
     target=$FAILURE_LOG_DIR/$name
     tmp=$FAILURE_LOG_DIR/.$name.tmp
-    # This device has no RTC: every boot starts at 1970, so records written by
+    # Boards without an RTC start every boot at 1970, so records written by
     # different boots share (or go backwards in) mtime and `ls -t` cannot
     # order them.  Pruning after the write let that arbitrary order delete the
     # record this boot had just written.  Make room before writing instead: the
