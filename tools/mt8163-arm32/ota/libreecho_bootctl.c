@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Amazon/MediaTek BCB control for the supported Biscuit boot layouts.
- * This tool never writes a boot image. It can write only misc: the BCB sector,
- * and (reboot-bootloader) the one-shot bootloader command at misc offset 0.
+ * This tool never writes a boot image. On the MT8163 chains it can write only
+ * misc: the BCB sector and (reboot-bootloader) the one-shot command at misc
+ * offset 0. On Lidar reboot-bootloader writes no partition at all: it asks the
+ * kernel for reboot mode "bootloader".
  */
 #define _FILE_OFFSET_BITS 64
 #include <errno.h>
@@ -12,8 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <linux/reboot.h>
 
 #define BCB_SECTOR_OFFSET 512
 #define BCB_IN_SECTOR 0x160
@@ -27,7 +31,7 @@ struct partition_contract {
     unsigned long sectors;
 };
 
-/* Two boot layouts are supported and a unit matches exactly one of them.
+/* Three boot layouts are supported and a unit matches exactly one of them.
  *
  * The legacy Amonet layout redirects LK's boot_a/boot_b reads to the _x stores
  * and keeps the Amonet header and tail payload in the large wrapper partitions,
@@ -36,6 +40,11 @@ struct partition_contract {
  *
  * Both name the same device node and the same reviewed sector count, and the BCB
  * this tool manipulates lives in misc either way. Only the names differ.
+ *
+ * The Lidar layout is the MT8167 GPT measured from the live unit. misc is 1024
+ * sectors rather than 1025 and p12 is a 65536-sector swdl partition where the
+ * MT8163 GPT has recovery, so a unit can only match one set. userdata is exact:
+ * the host installer formats the measured 9647071-sector partition.
  */
 static const struct partition_contract partitions_amonet[] = {
     {"/dev/mmcblk0p8", "/sys/class/block/mmcblk0p8", "misc", 1025},
@@ -53,6 +62,40 @@ static const struct partition_contract partitions_pinned[] = {
     {"/dev/mmcblk0p10", "/sys/class/block/mmcblk0p10", "boot_a", 32768},
     {"/dev/mmcblk0p11", "/sys/class/block/mmcblk0p11", "boot_b", 32768},
     {"/dev/mmcblk0p16", "/sys/class/block/mmcblk0p16", "userdata", 2137088},
+};
+
+static const struct partition_contract partitions_lidar[] = {
+    {"/dev/mmcblk0p8", "/sys/class/block/mmcblk0p8", "misc", 1024},
+    {"/dev/mmcblk0p9", "/sys/class/block/mmcblk0p9", "persist", 32768},
+    {"/dev/mmcblk0p10", "/sys/class/block/mmcblk0p10", "boot_a", 32768},
+    {"/dev/mmcblk0p11", "/sys/class/block/mmcblk0p11", "boot_b", 32768},
+    {"/dev/mmcblk0p12", "/sys/class/block/mmcblk0p12", "swdl", 65536},
+    {"/dev/mmcblk0p16", "/sys/class/block/mmcblk0p16", "userdata", 9647071},
+};
+
+/* How LK consumes the BCB is a measured property of the chain, not of the
+ * partition table. Flip only the store_mode field here when a hardware test
+ * proves whether Lidar's LK loads boot_b for suffix B. Until then Lidar is
+ * slotted, and its two slots are separate executable stores. */
+struct boot_layout_policy {
+    const char *layout;
+    const char *store_mode;
+    const char *slot_a_image;
+    const char *slot_b_image;
+    const char *backup_image;
+    const char *wrapper_a;
+    const char *wrapper_b;
+};
+
+static const struct boot_layout_policy layout_policies[] = {
+    {"amonet", "slotted", "/dev/mmcblk0p10", "/dev/mmcblk0p11", NULL,
+     "/dev/mmcblk0p17", "/dev/mmcblk0p18"},
+    /* Measured on the pinned chain (issue #231): LK always loads boot_a and the
+     * BCB only chooses the reported suffix and the tries accounting, so both
+     * slots execute the boot_a store and boot_b is a recovery copy. */
+    {"pinned", "fixed-a", "/dev/mmcblk0p10", "/dev/mmcblk0p10", "/dev/mmcblk0p11",
+     "-", "-"},
+    {"lidar", "slotted", "/dev/mmcblk0p10", "/dev/mmcblk0p11", NULL, "-", "-"},
 };
 
 #define CONTRACT_COUNT(set) (sizeof(set) / sizeof((set)[0]))
@@ -175,8 +218,8 @@ static int validate_set(const struct partition_contract *set, size_t count)
 }
 
 /* The legacy Amonet layout is validated first and unchanged, so a unit that has
- * always taken that path still does. Only a unit matching neither set fails, and
- * it fails exactly as before: with the legacy contract diagnostics. */
+ * always taken that path still does. Only a unit matching none of the sets fails,
+ * and it fails exactly as before: with the legacy contract diagnostics. */
 static int validate_layout(void)
 {
     contract_reporting = 0;
@@ -186,6 +229,10 @@ static int validate_layout(void)
     }
     if (validate_set(partitions_pinned, CONTRACT_COUNT(partitions_pinned)) == 0) {
         boot_layout = "pinned";
+        return 0;
+    }
+    if (validate_set(partitions_lidar, CONTRACT_COUNT(partitions_lidar)) == 0) {
+        boot_layout = "lidar";
         return 0;
     }
     contract_reporting = 1;
@@ -264,8 +311,19 @@ static int write_sector(const uint8_t *sector)
            !memcmp(sector, verify, SECTOR_SIZE) ? 0 : -1;
 }
 
+static const struct boot_layout_policy *layout_policy(void)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(layout_policies) / sizeof(layout_policies[0]); ++i)
+        if (!strcmp(layout_policies[i].layout, boot_layout))
+            return &layout_policies[i];
+    return NULL;
+}
+
 static void print_status(const uint8_t *bcb, int running_slot)
 {
+    const struct boot_layout_policy *policy = layout_policy();
     int selected = running_slot >= 0 ? running_slot : selected_slot(bcb);
 
     printf("schema=1\n");
@@ -277,23 +335,14 @@ static void print_status(const uint8_t *bcb, int running_slot)
     printf("slot_b_priority=%u\nslot_b_tries=%u\nslot_b_success=%u\n",
            slot_priority(bcb, 1), slot_tries(bcb, 1), slot_success(bcb, 1));
     printf("boot_layout=%s\n", boot_layout);
-    if (!strcmp(boot_layout, "pinned")) {
-        /* Measured on the pinned chain (issue #231): LK always loads boot_a and
-         * the BCB only chooses the slot suffix it reports and the tries
-         * accounting. Both slots therefore execute the boot_a store; boot_b
-         * is only a recovery copy of the previously running image. */
-        printf("boot_store_mode=fixed-a\n");
-        printf("slot_a_image=/dev/mmcblk0p10\n");
-        printf("slot_b_image=/dev/mmcblk0p10\n");
-        printf("backup_image=/dev/mmcblk0p11\n");
-        /* The pinned chain has no Amonet wrapper partitions. */
-        printf("wrapper_a=-\nwrapper_b=-\n");
-    } else {
-        printf("boot_store_mode=slotted\n");
-        printf("slot_a_image=/dev/mmcblk0p10\n");
-        printf("slot_b_image=/dev/mmcblk0p11\n");
-        printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
-    }
+    if (!policy)
+        return;
+    printf("boot_store_mode=%s\n", policy->store_mode);
+    printf("slot_a_image=%s\n", policy->slot_a_image);
+    printf("slot_b_image=%s\n", policy->slot_b_image);
+    if (policy->backup_image)
+        printf("backup_image=%s\n", policy->backup_image);
+    printf("wrapper_a=%s\nwrapper_b=%s\n", policy->wrapper_a, policy->wrapper_b);
 }
 
 static int parse_slot(const char *value)
@@ -411,6 +460,20 @@ static int misc_command_replaceable(const uint8_t *command)
     return 1;
 }
 
+/* Lidar enters fastboot when bit 2 of the TOPRGU NONRST2 register (0x10007024)
+ * survives a watchdog reset. The kernel exposes that single register as the
+ * `bootloader` reboot mode through syscon-reboot-mode, so userspace only names
+ * the mode: no misc command, no expdb, no partition write. A successful reboot
+ * does not return; if the call does return, the mode was not armed. */
+static int request_bootloader_mode(void)
+{
+    sync();
+    (void)syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+                  LINUX_REBOOT_CMD_RESTART2, "bootloader");
+    fprintf(stderr, "ERROR: RESTART2 bootloader request returned\n");
+    return -1;
+}
+
 static int request_bootloader(void)
 {
     uint8_t sector[SECTOR_SIZE], verify[SECTOR_SIZE];
@@ -418,6 +481,8 @@ static int request_bootloader(void)
     int fd;
     ssize_t length;
 
+    if (!strcmp(boot_layout, "lidar"))
+        return request_bootloader_mode();
     if (strcmp(boot_layout, "pinned")) {
         fprintf(stderr, "ERROR: restart to fastboot needs the pinned Kaeru chain\n");
         return -1;
@@ -470,7 +535,17 @@ int main(int argc, char **argv)
     int slot;
     int running_slot = -1;
 
-    if (validate_layout() || read_sector(sector)) {
+    if (validate_layout()) {
+        fprintf(stderr, "ERROR: cannot validate/read Biscuit boot control\n");
+        return 1;
+    }
+    /* Lidar asks the kernel for a reboot mode and touches no partition, so it
+     * needs neither the BCB read nor the BCB validity check. The MT8163 paths
+     * still read, validate and rewrite the BCB exactly as before. */
+    if (argc == 2 && !strcmp(argv[1], "reboot-bootloader") &&
+        !strcmp(boot_layout, "lidar"))
+        return request_bootloader() ? 1 : 0;
+    if (read_sector(sector)) {
         fprintf(stderr, "ERROR: cannot validate/read Biscuit boot control\n");
         return 1;
     }

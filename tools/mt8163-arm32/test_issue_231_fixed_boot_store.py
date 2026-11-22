@@ -43,13 +43,9 @@ class BootctlStoreModeTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.work.cleanup()
 
-    def status(self, names, wrappers=False):
+    def layout_status(self, records):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            records = {8: ('misc', 1025), 9: ('persist', 32768),
-                       10: (names[0], 32768), 11: (names[1], 32768), 16: ('userdata', 2153472)}
-            if wrappers:
-                records.update({17: ('boot_a', 225280), 18: ('boot_b', 225280)})
             for index, (name, size) in records.items():
                 directory = root / f'mmcblk0p{index}'
                 directory.mkdir()
@@ -58,6 +54,18 @@ class BootctlStoreModeTests(unittest.TestCase):
             result = run([str(self.binary), str(root), 'status'])
             self.assertEqual(result.returncode, 0, result.stderr)
             return dict(line.split('=', 1) for line in result.stdout.splitlines())
+
+    def status(self, names, wrappers=False):
+        records = {8: ('misc', 1025), 9: ('persist', 32768),
+                   10: (names[0], 32768), 11: (names[1], 32768), 16: ('userdata', 2153472)}
+        if wrappers:
+            records.update({17: ('boot_a', 225280), 18: ('boot_b', 225280)})
+        return self.layout_status(records)
+
+    def lidar_records(self):
+        return {8: ('misc', 1024), 9: ('persist', 32768),
+                10: ('boot_a', 32768), 11: ('boot_b', 32768),
+                12: ('swdl', 65536), 16: ('userdata', 9647071)}
 
     def test_pinned_layout_maps_both_slots_onto_boot_a(self):
         status = self.status(('boot_a', 'boot_b'))
@@ -74,6 +82,55 @@ class BootctlStoreModeTests(unittest.TestCase):
         self.assertEqual(status['slot_a_image'], '/dev/mmcblk0p10')
         self.assertEqual(status['slot_b_image'], '/dev/mmcblk0p11')
         self.assertNotIn('backup_image', status)
+
+    def test_lidar_layout_is_slotted_and_has_no_wrappers(self):
+        status = self.layout_status(self.lidar_records())
+        self.assertEqual(status['boot_layout'], 'lidar')
+        self.assertEqual(status['boot_store_mode'], 'slotted')
+        self.assertEqual(status['slot_a_image'], '/dev/mmcblk0p10')
+        self.assertEqual(status['slot_b_image'], '/dev/mmcblk0p11')
+        self.assertNotIn('backup_image', status)
+        self.assertEqual(status['wrapper_a'], '-')
+        self.assertEqual(status['wrapper_b'], '-')
+
+    def test_lidar_near_miss_geometry_is_rejected(self):
+        # misc is the MT8163 size, and p12 is absent or short: neither the
+        # MT8163 sets nor the Lidar set may match, so the probe fails closed.
+        for field, value in (('misc', 1023), ('swdl', 65535),
+                             ('swdl', 32768), ('userdata', 9647070),
+                             ('userdata', 2137088)):
+            with self.subTest(field=field, value=value):
+                records = self.lidar_records()
+                for index, (name, _) in list(records.items()):
+                    if name == field:
+                        records[index] = (name, value)
+                        break
+                else:
+                    self.fail(f'no {field} record')
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    for index, (name, size) in records.items():
+                        directory = root / f'mmcblk0p{index}'
+                        directory.mkdir()
+                        (directory / 'size').write_text(str(size) + '\n')
+                        (directory / 'uevent').write_text(
+                            'DEVTYPE=partition\nPARTNAME=' + name + '\n')
+                    result = run([str(self.binary), str(root), 'status'])
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertNotIn('boot_layout=lidar', result.stdout)
+
+    def test_lidar_missing_swdl_partition_is_rejected(self):
+        records = self.lidar_records()
+        del records[12]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, (name, size) in records.items():
+                directory = root / f'mmcblk0p{index}'
+                directory.mkdir()
+                (directory / 'size').write_text(str(size) + '\n')
+                (directory / 'uevent').write_text('DEVTYPE=partition\nPARTNAME=' + name + '\n')
+            result = run([str(self.binary), str(root), 'status'])
+            self.assertNotEqual(result.returncode, 0)
 
 
 class UpdaterStoreSelectionTests(unittest.TestCase):

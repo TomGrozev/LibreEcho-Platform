@@ -68,6 +68,7 @@ class VendorImporterCompatTests(unittest.TestCase):
         *,
         spec_dir: Path = SHIPPED_SPEC_DIR,
         force: bool = False,
+        target: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         data = root / "data"
         config = data / "libreecho/config"
@@ -78,9 +79,13 @@ class VendorImporterCompatTests(unittest.TestCase):
         if force:
             force_marker.write_text("force-unverified-owner-local-import-v1\n")
             force_marker.chmod(0o600)
+        target_file = root / "target"
+        if target is not None:
+            target_file.write_text(f"target_id={target}\n")
         environment = {
             **os.environ,
             "LIBREECHO_VENDOR_TEST_MODE": "1",
+            "LIBREECHO_VENDOR_TARGET_FILE": str(target_file),
             "DATA_ROOT": str(data),
             "LIBREECHO_VENDOR_SOURCE_ROOT": str(source),
             "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
@@ -98,6 +103,22 @@ class VendorImporterCompatTests(unittest.TestCase):
             timeout=15,
         )
         return result, config / "vendor-assets.tsv", Path(environment["LIBREECHO_VENDOR_STATUS_PATH"])
+
+    def test_lidar_reports_not_applicable_without_reading_system_a(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # The source root does not exist: a Lidar run must stop before it
+            # checks or mounts system_a.
+            result, enrolled, status = self.run_importer(
+                root, root / "missing-system-a", target="lidar")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("VENDOR_IMPORT_NOT_APPLICABLE target=lidar", result.stdout)
+            self.assertEqual(status.read_text(),
+                             "state=not-applicable\nverification=none\n"
+                             "source_partition=system_a\nsource_layout=none\n"
+                             "force_requested=0\n"
+                             "error=target-mt8167-no-mt8163-firmware\n")
+            self.assertFalse(enrolled.exists())
 
     def test_second_validated_revision_is_shipped_as_one_atomic_manifest(self) -> None:
         self.assertEqual(

@@ -328,7 +328,7 @@ load_fetch_target()
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then TARGET_SLUG=radar-puffin; return 0; fi
     [ -f "$file" ] && [ ! -L "$file" ] && [ "$($BB grep -c '^target_id=' "$file")" = 1 ] || die source_target
     id=$($BB sed -n 's/^target_id=//p' "$file")
-    case "$id" in radar_puffin) TARGET_SLUG=radar-puffin;; biscuit) TARGET_SLUG=biscuit;; *) die source_target;; esac
+    case "$id" in radar_puffin) TARGET_SLUG=radar-puffin;; biscuit) TARGET_SLUG=biscuit;; lidar) TARGET_SLUG=lidar;; *) die source_target;; esac
 }
 
 read_dev_release_pointer()

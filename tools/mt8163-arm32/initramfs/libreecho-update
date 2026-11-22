@@ -119,6 +119,7 @@ load_image_target()
     case "$TARGET_ID" in
         radar_puffin) TARGET_SLUG=radar-puffin ;;
         biscuit) TARGET_SLUG=biscuit ;;
+        lidar) TARGET_SLUG=lidar ;;
         *) TARGET_ID=; return 1 ;;
     esac
 }

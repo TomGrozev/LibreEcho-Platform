@@ -26,6 +26,7 @@ SOURCE_ROOT=${LIBREECHO_VENDOR_SOURCE_ROOT:-}
 STAGE_PARENT=${LIBREECHO_VENDOR_STAGE_PARENT:-/tmp/libreecho-vendor-import}
 STATUS_PATH=${LIBREECHO_VENDOR_STATUS_PATH:-/run/libreecho/vendor-import.status}
 FORCE_MARKER=${LIBREECHO_VENDOR_FORCE_MARKER:-$DATA_ROOT/libreecho/config/vendor-import-force-next-boot}
+TARGET_FILE=${LIBREECHO_VENDOR_TARGET_FILE:-/etc/libreecho/target}
 MOUNT_ROOT=/tmp/libreecho-stock-system-a
 SOURCE_LAYOUTS='etc/firmware vendor/firmware system/vendor/firmware system/etc/firmware'
 STAGE=
@@ -77,6 +78,19 @@ prepare_status_path()
     if [ -e "$STATUS_PATH" ]; then
         [ -f "$STATUS_PATH" ] && [ ! -L "$STATUS_PATH" ] || return 1
     fi
+}
+
+# The pinned bundle is MT8163 Wi-Fi firmware read from the stock system_a. A
+# Lidar image is MT8167: its stock system_a carries a different firmware set,
+# so this import cannot succeed there. Report not-applicable instead of a
+# failure, and leave the boot-health verdict untouched. An unreadable target
+# file keeps the old behaviour so a damaged identity fails closed elsewhere.
+vendor_import_applicable()
+{
+    vi_target=
+    [ -f "$TARGET_FILE" ] && [ ! -L "$TARGET_FILE" ] || return 0
+    vi_target=$(sed -n 's/^target_id=//p' "$TARGET_FILE" 2>/dev/null | head -n 1)
+    [ "$vi_target" != lidar ]
 }
 
 fail()
@@ -443,6 +457,13 @@ enrol_for_future_boots()
 }
 
 prepare_status_path || fail VENDOR_IMPORT_STATUS_PATH_UNSAFE
+if ! vendor_import_applicable; then
+    STATUS_STATE=not-applicable
+    STATUS_ERROR=target-mt8167-no-mt8163-firmware
+    write_status
+    printf 'VENDOR_IMPORT_NOT_APPLICABLE target=lidar\n'
+    exit 0
+fi
 validate_spec_file "$SPEC"
 write_status
 

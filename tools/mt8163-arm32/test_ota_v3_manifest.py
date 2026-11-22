@@ -13,10 +13,11 @@ FEATURES = ('airplay2', 'tts', 'wakeword', 'stt', 'assistant')
 DAEMONS = ('libreecho-audio-engine', 'libreecho-ttsd', 'libreecho-waked', 'libreecho-sttd', 'libreecho-agentd')
 
 
-def manifest(assets=None, tx='test-target'):
+def manifest(assets=None, tx='test-target', board='radar_puffin', soc='mt8163',
+             slug='radar-puffin'):
     assets = assets or {f: (('payload:' + f).encode(), ('manifest:' + f).encode()) for f in FEATURES}
     rows = [('format', 'libreecho-ota-v3'), ('manifest_version', '1'),
-            ('board', 'radar_puffin'), ('soc', 'mt8163'), ('architecture', 'armv7'),
+            ('board', board), ('soc', soc), ('architecture', 'armv7'),
             ('image_profile', 'ota'), ('transaction_type', 'system'), ('transaction_id', tx),
             ('release', 'radar-puffin-v0.14.0-test'), ('version', '0.14.0'),
             ('update_channel', 'dev'), ('service_profile', 'production'),
@@ -27,9 +28,9 @@ def manifest(assets=None, tx='test-target'):
         p, m = assets[f]
         ph, mh = hashlib.sha256(p).hexdigest(), hashlib.sha256(m).hexdigest()
         rows.extend((('feature_' + f + '_' + k, str(v)) for k, v in (
-            ('asset', f'libreecho-radar-puffin-base-{f}-{ph}.payload.squashfs'),
+            ('asset', f'libreecho-{slug}-base-{f}-{ph}.payload.squashfs'),
             ('size', len(p)), ('sha256', ph),
-            ('manifest_asset', f'libreecho-radar-puffin-base-{f}-{mh}.manifest.json'),
+            ('manifest_asset', f'libreecho-{slug}-base-{f}-{mh}.manifest.json'),
             ('manifest_size', len(m)), ('manifest_sha256', mh),
             ('daemon_path', 'usr/local/sbin/' + daemon), ('daemon_sha256', 'b' * 64))))
     rows.append(('config_schema', '1'))
@@ -67,6 +68,19 @@ class ManifestTests(SignedFixture):
     def test_accepts_canonical_v3(self):
         result = self.check(manifest())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_lidar_identity_with_mt8167_soc(self):
+        (self.root / 'target').write_text('target_id=lidar\n')
+        result = self.check(manifest(board='lidar', soc='mt8167', slug='lidar'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lidar_refuses_the_mt8163_soc(self):
+        (self.root / 'target').write_text('target_id=lidar\n')
+        for soc in ('mt8163', 'wrong'):
+            with self.subTest(soc=soc):
+                result = self.check(manifest(board='lidar', soc=soc, slug='lidar'))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('manifest-soc', result.stderr)
 
     def test_rejects_forbidden_keys(self):
         for key in ('feature_wakeword_action', 'feature_wakeword_base_payload_sha256',

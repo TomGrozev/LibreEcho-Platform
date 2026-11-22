@@ -244,6 +244,9 @@ class RuntimeTargetTests(unittest.TestCase):
             else: target_file.write_text('target_id=' + target + '\n')
             raw = fixture.text.replace('board=radar_puffin', 'board=' + board)
             if board == 'biscuit': raw = raw.replace('libreecho-radar-puffin-', 'libreecho-biscuit-')
+            if board == 'lidar':
+                raw = (raw.replace('soc=mt8163', 'soc=mt8167')
+                          .replace('libreecho-radar-puffin-', 'libreecho-lidar-'))
             if mutate: raw = mutate(raw)
             if consumer == 'libreecho-update':
                 return fixture.inspect(raw)
@@ -262,6 +265,37 @@ class RuntimeTargetTests(unittest.TestCase):
         for target in ('radar_puffin', 'biscuit'):
             result = self.check(target, target)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lidar_v3_acceptance_requires_mt8167(self):
+        for consumer in ('libreecho-update', 'libreecho-feature-transaction'):
+            result = self.check('lidar', 'lidar', consumer=consumer)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.check('lidar', 'lidar', consumer=consumer,
+                                mutate=lambda raw: raw.replace('soc=mt8167', 'soc=mt8163'))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('manifest-soc', result.stderr)
+
+    def test_fetch_target_identity_accepts_lidar_and_refuses_unknown(self):
+        source = (TOOLS / 'initramfs/libreecho-update-fetch').read_text()
+        body = function(source, 'load_fetch_target')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); target = root / 'target'
+            for identity, slug, accepted in [('radar_puffin', 'radar-puffin', True),
+                                             ('biscuit', 'biscuit', True),
+                                             ('lidar', 'lidar', True),
+                                             ('unknown', None, False)]:
+                target.write_text('target_id=' + identity + '\n')
+                script = root / 'fetch-target.sh'
+                script.write_text('BB=/bin/busybox\nTARGET_FILE=' + shlex.quote(str(target))
+                                  + '\ndie() { echo "$*" >&2; exit 1; }\n' + body
+                                  + '\nTARGET_SLUG=\nload_fetch_target\necho "slug=$TARGET_SLUG"\n')
+                result = subprocess.run(['/bin/busybox', 'sh', str(script)],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if accepted:
+                    self.assertEqual(result.stdout.strip(), 'slug=' + slug)
+                else:
+                    self.assertIn('source_target', result.stderr)
 
     def test_cross_target_v3_refused(self):
         for consumer in ('libreecho-update', 'libreecho-feature-transaction'):

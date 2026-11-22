@@ -4250,14 +4250,19 @@ start_feature_service_if_enabled
         # Both contract sets exist, and the legacy set is selected first.
         self.assertIn("partitions_amonet[]", source)
         self.assertIn("partitions_pinned[]", source)
+        self.assertIn("partitions_lidar[]", source)
         self.assertLess(
             source.index('boot_layout = "amonet"'),
             source.index('boot_layout = "pinned"'),
         )
+        self.assertLess(
+            source.index('boot_layout = "pinned"'),
+            source.index('boot_layout = "lidar"'),
+        )
 
         # The pinned set pins the same nodes and sizes and has no wrappers.
         pinned = source[
-            source.index("partitions_pinned[]") : source.index("#define CONTRACT_COUNT")
+            source.index("partitions_pinned[]") : source.index("partitions_lidar[]")
         ]
         for expected in ("mmcblk0p8", "mmcblk0p9", "mmcblk0p10", "mmcblk0p11", "mmcblk0p16"):
             self.assertIn(expected, pinned)
@@ -4265,6 +4270,19 @@ start_feature_service_if_enabled
         self.assertIn('"boot_b", 32768', pinned)
         self.assertNotIn("mmcblk0p17", pinned)
         self.assertNotIn("mmcblk0p18", pinned)
+
+        # The Lidar set is the measured MT8167 GPT: misc 1024, a p12 swdl
+        # partition, the exact userdata, and no wrappers. Its store mode is one
+        # table entry so a hardware result flips one line.
+        lidar_start = source.index("partitions_lidar[]")
+        lidar = source[lidar_start : source.index("};", lidar_start)]
+        self.assertIn('"misc", 1024', lidar)
+        self.assertIn('"swdl", 65536', lidar)
+        self.assertIn('"userdata", 9647071', lidar)
+        self.assertNotIn("mmcblk0p17", lidar)
+        self.assertNotIn("mmcblk0p18", lidar)
+        self.assertIn('{"lidar", "slotted", "/dev/mmcblk0p10", "/dev/mmcblk0p11"',
+                      source)
 
         # Probing the unused layout stays quiet; the failing set still reports, and
         # the selected layout is reported so an operator can see which one matched.

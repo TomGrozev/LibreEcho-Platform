@@ -3,9 +3,13 @@
  * Every /dev/mmcblk0pN and /sys/class/block path is redirected into a fixture
  * directory, so the real request path runs against regular files.  Each open
  * is recorded with its flags so the test can prove expdb is never opened for
- * writing.
+ * writing.  The reboot syscall is replaced on the same seam: a Lidar request
+ * must call RESTART2 with mode "bootloader" and must not open a partition at
+ * all, so the stub records its arguments in syscall.log and fails as if the
+ * call returned.
  */
 #define _FILE_OFFSET_BITS 64
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -16,6 +20,34 @@
 
 static const char *fixture_root;
 static FILE *open_log;
+
+static long fixture_syscall(long number, ...)
+{
+    va_list arguments;
+    long magic1, magic2, command;
+    const char *mode;
+    char path[1024];
+    FILE *log;
+
+    (void)number;
+    va_start(arguments, number);
+    magic1 = va_arg(arguments, long);
+    magic2 = va_arg(arguments, long);
+    command = va_arg(arguments, long);
+    mode = va_arg(arguments, const char *);
+    va_end(arguments);
+    snprintf(path, sizeof(path), "%s/syscall.log", fixture_root);
+    log = fopen(path, "w");
+    if (log) {
+        fprintf(log, "reboot %ld %ld %ld %s\n",
+                magic1, magic2, command, mode ? mode : "-");
+        fclose(log);
+    }
+    /* A real RESTART2 does not return.  Failing here proves the tool reports
+     * that case instead of pretending the reboot happened. */
+    errno = EPERM;
+    return -1;
+}
 
 static int map_path(const char *path, char *mapped, size_t size)
 {
@@ -54,6 +86,7 @@ static int fixture_open(const char *path, int flags, ...)
 
 #define stat(path, output) fixture_stat(path, output)
 #define open fixture_open
+#define syscall fixture_syscall
 #define main bootctl_main
 #include "libreecho_bootctl.c"
 #undef main

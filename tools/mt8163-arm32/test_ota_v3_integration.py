@@ -202,6 +202,69 @@ class UpdaterTests(grammar.SignedFixture):
         self.assertEqual((self.root / 'activated').read_text(), 'b\n')
         self.assertFalse((directory.parent / 'test-target.pin').exists())
 
+    def test_lidar_install_and_confirm_use_slotted_stores(self):
+        """The Lidar identity installs to boot_b and confirms the same slot."""
+        (self.root / 'target').write_text('target_id=lidar\n')
+        self.text = grammar.manifest(board='lidar', soc='mt8167', slug='lidar').replace(
+            'boot_sha256=' + 'a' * 64, 'boot_sha256=' + hashlib.sha256(self.boot).hexdigest())
+        p, sig = self.signed(self.text)
+        directory = self.data / 'libreecho/generations/test-target'
+        directory.mkdir(parents=True)
+        (directory.parent / 'test-target.pin').write_text('test-target\n')
+        (directory / 'target.manifest').write_bytes(p.read_bytes())
+        (directory / 'target.manifest.sig').write_bytes(sig.read_bytes())
+        (directory / 'COMPLETE').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '\n')
+        for f in grammar.FEATURES:
+            feature = directory / 'features' / f
+            feature.mkdir(parents=True)
+            (feature / 'payload.squashfs').write_bytes(('payload:' + f).encode())
+            (feature / 'manifest.json').write_bytes(('manifest:' + f).encode())
+        (self.control_file('current')).write_text('prior\n')
+        (self.root / 'boot.img').write_bytes(self.boot)
+        package = self.root / 'package.tar'
+        with tarfile.open(package, 'w') as tar:
+            for path, name in ((p, 'manifest'), (sig, 'manifest.sig'), (self.root / 'boot.img', 'boot.img')):
+                tar.add(path, arcname=name)
+        boot_b = self.root / 'mmcblk0p11'
+        boot_b.write_bytes(b'old')
+        bootctl = self.root / 'bootctl'
+        bootctl.write_text('#!/bin/sh\ncase "$1" in status) echo selected_slot=a; echo inactive_slot=b; '
+                           'echo slot_a_success=1;; activate) echo "$2" > "$ACTIVATED";; esac\n')
+        bootctl.chmod(0o755)
+        script = self.script('install_package "$1"')
+        text = script.read_text().replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl))
+        text = text.replace('install_package "$1"',
+                            'target_device_for_slot() { target_device="' + str(boot_b) + '"; }\ninstall_package "$1"')
+        script.write_text(text)
+        env = dict(self.env, GENERATION_TOOL=str(TOOLS / 'initramfs/libreecho-generation'),
+                   GENERATIONS=str(directory.parent), ROOT=str(self.update),
+                   ACTIVATED=str(self.root / 'activated'))
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(boot_b.read_bytes(), self.boot)
+        self.assertIn('slot=b\n', self.control_file('pending').read_text())
+        self.assertEqual((self.root / 'activated').read_text(), 'b\n')
+
+        calls = self.root / 'calls'
+        helper = self.root / 'transaction'
+        helper.write_text('#!/bin/sh\necho "transaction:$1" >> "$CALLS"\n')
+        helper.chmod(0o755)
+        confirm_bootctl = self.root / 'confirm-bootctl'
+        confirm_bootctl.write_text('#!/bin/sh\necho "bootctl:$1:$2" >> "$CALLS"\n')
+        confirm_bootctl.chmod(0o755)
+        confirm = self.script('target_device_for_slot() { :; }\nconfirm_pending')
+        confirm.write_text(confirm.read_text().replace(
+            'FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction', 'FEATURE_TRANSACTION=' + str(helper)
+        ).replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(confirm_bootctl)))
+        result = subprocess.run(['/bin/busybox', 'sh', str(confirm)],
+                                env=dict(self.env, CALLS=str(calls)),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('UPDATE_CONFIRMED slot=b', result.stdout)
+        self.assertEqual(calls.read_text().splitlines(),
+                         ['transaction:verify-running', 'bootctl:confirm:b', 'transaction:commit'])
+
     def test_confirm_v3_calls_target_activation_then_slot_confirm_then_commit(self):
         self.control_file('pending').write_text('schema=3\nslot=b\ntransaction_id=test-target\nmanifest_sha256=' + 'a' * 64 + '\n')
         calls = self.root / 'calls'

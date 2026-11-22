@@ -21,6 +21,7 @@ load_image_target()
     case "$TARGET_ID" in
         radar_puffin) TARGET_SLUG=radar-puffin ;;
         biscuit) TARGET_SLUG=biscuit ;;
+        lidar) TARGET_SLUG=lidar ;;
         *) TARGET_ID=; return 1 ;;
     esac
 }
@@ -131,7 +132,14 @@ check_manifest() {
     [ "$(value manifest_version "$manifest")" = 1 ] || fail manifest-version
     load_image_target || fail image-target
     [ "$(value board "$manifest")" = "$TARGET_ID" ] || fail manifest-board
-    [ "$(value soc "$manifest")" = mt8163 ] || fail manifest-soc
+    # SoC follows the image identity, never a global default. The supported
+    # MT8163 targets stay byte-identical; Lidar is MT8167 with the same ARMv7
+    # userspace.
+    case "$TARGET_ID" in
+        lidar) expected_soc=mt8167 ;;
+        *) expected_soc=mt8163 ;;
+    esac
+    [ "$(value soc "$manifest")" = "$expected_soc" ] || fail manifest-soc
     [ "$(value architecture "$manifest")" = armv7 ] || fail manifest-architecture
     [ "$(value image_profile "$manifest")" = ota ] || fail manifest-profile
     [ "$(value transaction_type "$manifest")" = system ] || fail transaction-type

@@ -29,13 +29,29 @@ sectors) and `boot_b` (`/dev/mmcblk0p11`, 32768 sectors) are the stores LK reads
 and `/dev/mmcblk0p17` and `/dev/mmcblk0p18` do not exist. The updater writes the
 inactive store directly, exactly as it writes `_x` on the Amonet layout.
 
+### Lidar layout (MT8167)
+
+The Echo Plus 2nd Gen GPT measured from the live unit has no wrapper partitions
+and no `recovery` partition. The stores are `boot_a` (`/dev/mmcblk0p10`, 32768
+sectors) and `boot_b` (`/dev/mmcblk0p11`, 32768 sectors). `misc`
+(`/dev/mmcblk0p8`) is 1024 sectors, not 1025, and p12 is `swdl` at 65536 sectors
+where the MT8163 GPT has `recovery`. `persist` is p9 and `userdata` is p16 at
+9647071 sectors, accepted exactly.
+
+Lidar starts as `boot_store_mode=slotted` because whether its LK loads `boot_b`
+for suffix B is not yet measured. The decision lives in one entry of the
+layout table in `libreecho_bootctl.c`; a hardware result flips that entry to
+`fixed-a` without touching the rest of the tool. Lidar reports
+`boot_layout=lidar`, `slot_a_image=/dev/mmcblk0p10`, and
+`slot_b_image=/dev/mmcblk0p11`, with `wrapper_a=-` and `wrapper_b=-`.
+
 `libreecho-bootctl` validates the Amonet contract set first and unchanged, then
-the pinned set, and reports which one matched as `boot_layout=`. Probing the
-layout a unit does not use stays quiet, and a unit matching neither fails closed
-with the Amonet contract diagnostics.
+the pinned set, then the Lidar set, and reports which one matched as
+`boot_layout=`. Probing the layouts a unit does not use stays quiet, and a unit
+matching none fails closed with the Amonet contract diagnostics.
 
 The Amazon BCB is 7 bytes at offset `0x360` in `misc`
-(`/dev/mmcblk0p8`, 1025 sectors):
+(`/dev/mmcblk0p8`; 1025 sectors on the MT8163 layouts, 1024 on Lidar):
 
 ```text
 zero, "ABB", version,
@@ -460,3 +476,10 @@ reads it back. Kaeru enters fastboot and clears the command, so `fastboot
 reboot` returns to LibreEcho. The request is refused, with nothing written, on
 the legacy layout, without a proven payload, or when misc already holds a
 different command.
+
+On Lidar the same `/tmp/reboot.request` value takes a different route.
+`libreecho-bootctl reboot-bootloader` opens no partition: it calls `sync()` and
+then `reboot(LINUX_REBOOT_CMD_RESTART2, "bootloader")`. The kernel exposes bit
+2 of the TOPRGU NONRST2 register through `syscon-reboot-mode` as that mode, and
+stock LK enters fastboot when the bit survives the watchdog reset. If the
+syscall returns, the tool reports an error; a successful request never returns.

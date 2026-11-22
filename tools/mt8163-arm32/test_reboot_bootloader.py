@@ -40,11 +40,16 @@ class RebootBootloaderTests(unittest.TestCase):
 
     def fixture(self, root, *, layout="pinned", expdb=KAERU_HEADER, misc_command=b"",
                 expdb_name="expdb", expdb_sectors=20480):
-        names = {"pinned": ("boot_a", "boot_b"), "amonet": ("boot_a_x", "boot_b_x")}[layout]
+        names = {"pinned": ("boot_a", "boot_b"), "amonet": ("boot_a_x", "boot_b_x"),
+                 "lidar": ("boot_a", "boot_b")}[layout]
         records = {7: (expdb_name, expdb_sectors), 8: ("misc", 1025), 9: ("persist", 32768),
                    10: (names[0], 32768), 11: (names[1], 32768), 16: ("userdata", 2153472)}
         if layout == "amonet":
             records.update({17: ("boot_a", 225280), 18: ("boot_b", 225280)})
+        if layout == "lidar":
+            records[8] = ("misc", 1024)
+            records[12] = ("swdl", 65536)
+            records[16] = ("userdata", 9647071)
         (root / "dev").mkdir()
         for index, (name, size) in records.items():
             directory = root / f"mmcblk0p{index}"
@@ -139,6 +144,39 @@ class RebootBootloaderTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual((root / "dev/mmcblk0p8").read_bytes(), misc)
                 self.assertEqual((root / "dev/mmcblk0p7").read_bytes(), exp)
+
+    def test_lidar_requests_restart2_and_opens_no_partition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            misc_before, expdb_before = self.fixture(root, layout="lidar")
+            result = self.request(root)
+            # The stub returns the way a real syscall would not; the tool must
+            # treat that as a failure instead of claiming success.
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("RESTART2 bootloader request returned", result.stderr)
+            self.assertEqual(self.opens(root), [])
+            self.assertEqual((root / "dev/mmcblk0p8").read_bytes(), misc_before)
+            self.assertEqual((root / "dev/mmcblk0p7").read_bytes(), expdb_before)
+            self.assertEqual((root / "syscall.log").read_text().strip(),
+                             "reboot 4276215469 672274793 2712847316 bootloader")
+
+    def test_lidar_activate_and_confirm_write_only_the_bcb(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root, layout="lidar")
+            result = run([str(self.binary), str(root), "activate", "b"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("boot_layout=lidar", result.stdout)
+            self.assertIn("boot_store_mode=slotted", result.stdout)
+            misc = (root / "dev/mmcblk0p8").read_bytes()
+            self.assertEqual(misc[0:32], bytes(32))
+            self.assertEqual(misc[512 + 0x160:512 + 0x167],
+                             bytes([0, ord("A"), ord("B"), ord("B"), 1, 0x8E, 0x3F]))
+            result = run([str(self.binary), str(root), "confirm", "b"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            misc = (root / "dev/mmcblk0p8").read_bytes()
+            self.assertEqual(misc[512 + 0x160:512 + 0x167],
+                             bytes([0, ord("A"), ord("B"), ord("B"), 1, 0x8E, 0x8F]))
 
 
 class InitRoutingTests(unittest.TestCase):
