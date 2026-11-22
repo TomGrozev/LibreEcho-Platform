@@ -97,6 +97,22 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.mount_log.exists())
 
+    def test_last_try_candidate_activates_despite_fallback_selection(self):
+        self.prepared()
+        last_try = ('selected_slot=a\n'
+                    'slot_a_priority=14\nslot_a_tries=0\nslot_a_success=1\n'
+                    'slot_b_priority=15\nslot_b_tries=0\nslot_b_success=0\n')
+        self.bcb.write_text(last_try)
+        result = self.verb('activate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.mount_log.read_text().splitlines()), 5)
+        # The same shape with a try left is a real mismatch, not the last try:
+        # the bootloader would still have loaded b and selected b next boot.
+        self.bcb.write_text(last_try.replace('slot_b_tries=0', 'slot_b_tries=2'))
+        result = self.verb('activate')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('running-selected-mismatch', result.stderr.replace('\n', ' '))
+
     def test_activate_exact_pending_readonly_loop_mounts(self):
         self.prepared()
         result = self.verb('activate')

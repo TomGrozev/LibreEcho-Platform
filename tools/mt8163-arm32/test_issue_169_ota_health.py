@@ -145,6 +145,7 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
             (["ERROR:update_directory_failed"], "ota-confirm:ERROR:update_directory_failed"),
             (["ERROR:boot_control_target"], "ota-confirm:ERROR:boot_control_target"),
             (["ERROR:boot_target_identity"], "ota-confirm:ERROR:boot_target_identity"),
+            (["ERROR:feature_target_not_ready"], "ota-confirm:ERROR:feature_target_not_ready"),
             (["ERROR:state_write_failed"], "ota-confirm:ERROR:state_write_failed"),
             (["ERROR:state_commit_failed"], "ota-confirm:ERROR:state_commit_failed"),
             (["ERROR:pending_feature_policy"], "ota-confirm:ERROR:pending_feature_policy"),

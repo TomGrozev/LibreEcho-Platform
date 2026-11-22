@@ -470,7 +470,7 @@ persist_failure_log()
 ota_confirm_error_token()
 {
     confirm_token=$($BB grep -xE \
-        'ERROR:(update_busy|update_directory_failed|no_pending_update|boot_control_target|boot_target_identity|pending_boot_hash|boot_control_running_readback|feature_runtime_not_ready|boot_control_confirm|boot_control_readback|boot_control_readback_ambiguous|feature_commit_pending|state_write_failed|state_commit_failed|userdata_identity_or_mount_failed|pending_feature_policy|pending_update_channel|packaged_update_channel|pending_channel_preserve|current_service_profile_unavailable|preserve_identity_source|preserve_feature_(payload(_size)?_mismatch|manifest_mismatch|daemon_(not_running|unavailable|mismatch)))' \
+        'ERROR:(update_busy|update_directory_failed|no_pending_update|boot_control_target|boot_target_identity|pending_boot_hash|boot_control_running_readback|feature_runtime_not_ready|feature_target_not_ready|boot_control_confirm|boot_control_readback|boot_control_readback_ambiguous|feature_commit_pending|state_write_failed|state_commit_failed|userdata_identity_or_mount_failed|pending_feature_policy|pending_update_channel|packaged_update_channel|pending_channel_preserve|current_service_profile_unavailable|preserve_identity_source|preserve_feature_(payload(_size)?_mismatch|manifest_mismatch|daemon_(not_running|unavailable|mismatch)))' \
         "$1" 2>/dev/null | $BB head -n 1)
     printf '%s\n' "${confirm_token:-ERROR:confirm-failed-no-detail}"
 }
@@ -2094,7 +2094,7 @@ activate_feature_transaction()
             if [ "$v3_slot" != "$v3_running" ]; then
                 "$transaction" rollback || return 1
             else
-                v3_bcb=$(/usr/local/sbin/libreecho-bootctl status) || return 1
+                v3_bcb=$(/usr/local/sbin/libreecho-bootctl status "$v3_running") || return 1
                 v3_success=$(printf '%s\n' "$v3_bcb" | $BB sed -n "s/^slot_${v3_slot}_success=//p")
                 if [ "$v3_success" = 1 ]; then
                     "$transaction" commit || return 1

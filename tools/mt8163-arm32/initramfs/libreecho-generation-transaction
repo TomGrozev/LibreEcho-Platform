@@ -217,19 +217,46 @@ image_hash() {
     $BB dd if="$1" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}'
 }
 read_bcb() {
-    local bcb running
-    bcb=$("$BOOTCTL" status) || fail boot-control-read
+    local bcb bare running next running_priority running_tries running_success
+    local selected_priority v
+    # Bare status names the bootloader's next-boot selection; only the caller
+    # knows which slot is executing, so ask for that slot explicitly.
+    bare=$("$BOOTCTL" status) || fail boot-control-read
+    [ "$(printf '%s\n' "$bare" | $BB grep -c '^selected_slot=')" = 1 ] || fail bcb-grammar
+    next=$(printf '%s\n' "$bare" | $BB sed -n 's/^selected_slot=//p')
+    case "$next" in a|b) ;; *) fail bcb-selected;; esac
+    running=$($BB tr ' ' '\n' < "$CMDLINE_FILE" | $BB sed -n 's/^androidboot.slot_suffix=_//p')
+    # Measured Biscuit LK emits an empty suffix; absence has the same BCB fallback.
+    case "$running" in
+        '') bcb=$bare; running=$next ;;
+        a|b) bcb=$("$BOOTCTL" status "$running") || fail boot-control-read ;;
+        *) fail running-slot ;;
+    esac
     [ "$(printf '%s\n' "$bcb" | $BB grep -c '^selected_slot=')" = 1 ] || fail bcb-grammar
-    SELECTED=$(printf '%s\n' "$bcb" | $BB sed -n 's/^selected_slot=//p')
-    case "$SELECTED" in a|b) ;; *) fail bcb-selected;; esac
+    read_store_mode "$bcb"
+    SELECTED=$running
+    if [ "$running" != "$next" ]; then
+        # The bootloader decrements a candidate's tries before it boots, so on
+        # the final permitted attempt bare `status` names the next boot's
+        # fallback while this kernel is the candidate that was loaded.  The
+        # cmdline suffix is the authority on what is executing; accept only
+        # that documented window -- the running slot is the higher-priority
+        # candidate with no tries and no success left -- and then treat it as
+        # the selected slot, which is what every candidate check below means.
+        running_priority=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${running}_priority=//p")
+        running_tries=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${running}_tries=//p")
+        running_success=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${running}_success=//p")
+        selected_priority=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${next}_priority=//p")
+        for v in "$running_priority" "$running_tries" "$running_success" "$selected_priority"; do
+            case "$v" in ''|*[!0-9]*) fail bcb-grammar;; esac
+        done
+        [ "$running_tries" = 0 ] && [ "$running_success" = 0 ] &&
+            [ "$running_priority" -ge "$selected_priority" ] ||
+            fail running-selected-mismatch
+    fi
     [ "$(printf '%s\n' "$bcb" | $BB grep -c "^slot_${SELECTED}_success=")" = 1 ] || fail bcb-grammar
     SUCCESS=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${SELECTED}_success=//p")
     case "$SUCCESS" in 0|1) ;; *) fail bcb-success;; esac
-    read_store_mode "$bcb"
-    running=$($BB tr ' ' '\n' < "$CMDLINE_FILE" | $BB sed -n 's/^androidboot.slot_suffix=_//p')
-    # Measured Biscuit LK emits an empty suffix; absence has the same BCB fallback.
-    case "$running" in '') running=$SELECTED;; a|b) ;; *) fail running-slot;; esac
-    [ "$running" = "$SELECTED" ] || fail running-selected-mismatch
 }
 verify_boot() {
     local device actual
