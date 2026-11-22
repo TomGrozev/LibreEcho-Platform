@@ -75,6 +75,8 @@
 #define WIDE_PERIOD_SIZE 1024U
 #define WIDE_PERIOD_COUNT 3U
 #define AMP_SETTLE_US 30000U
+/* Poll slice of the bounded end-of-session drain; see drain_output_pcm(). */
+#define OUTPUT_DRAIN_SLICE_US 5000U
 #define SOURCE_COUNT 5U
 #define SOURCE_IDLE_PERIODS 8U
 #define AIRPLAY_ACK_GRACE_READS 24U
@@ -2839,6 +2841,96 @@ static struct pcm *open_output_pcm(unsigned int card, unsigned int device,
 	return pcm_open(card, device, OUTPUT_PCM_FLAGS, s16);
 }
 
+/*
+ * Play a producer's sub-period remainder before the session closes.
+ *
+ * A cue that is not a whole number of periods leaves its fade-out in the
+ * source ring, where period_ready() can never select it; at teardown it was
+ * simply discarded.  Pad that tail with silence to one period, render and
+ * write it, then consume it so the next session starts clean.  Only whole
+ * input frames are kept: a torn trailing sample cannot be completed.
+ */
+static int play_partial_tail(struct source_bus *sources, struct pcm *pcm,
+			     int16_t *output, struct puffin_dynamics *dynamics,
+			     struct speaker_dsp *speaker,
+			     struct le_aec_reference_sender *reference,
+			     int master, int32_t *master_gain)
+{
+	const size_t frame_bytes = INPUT_CHANNELS * sizeof(int16_t);
+	const size_t period_bytes = PERIOD_SIZE * frame_bytes;
+	unsigned int i;
+	int pending = 0;
+
+	for (i = 0; i < SOURCE_COUNT; ++i) {
+		struct source_bus *source = &sources[i];
+		size_t tail;
+
+		if (i == SOURCE_AIRPLAY && source->airplay_volume_missing)
+			continue;
+		if (source->received == 0 || source->received >= period_bytes)
+			continue;
+		tail = source->received - source->received % frame_bytes;
+		if (tail == 0) {
+			source->received = 0;
+			continue;
+		}
+		memset((unsigned char *)source->samples + tail, 0,
+		       period_bytes - tail);
+		source->received = period_bytes;
+		pending = 1;
+	}
+	if (!pending)
+		return 0;
+	avl_master_percent = master;
+	speaker_dsp_set_volume(speaker, speaker_volume_percent(sources, master));
+	if (biscuit_chain)
+		biscuit_dsp_set_volume(biscuit_chain,
+			speaker_volume_percent(sources, master));
+	(void)sendspin_stage(&g_sendspin);
+	render_period(sources, g_sendspin.stage, g_sendspin.stage_frames, output,
+		      dynamics, speaker, logical_master_gain(master), master_gain);
+	if (write_period(pcm, output, reference,
+			 ready_activity_mask(sources)) < 0) {
+		fprintf(stderr, "audio-engine: PCM tail write failed: %s\n",
+			pcm_get_error(pcm));
+		return -1;
+	}
+	consume_period(sources);
+	return 1;
+}
+
+/*
+ * Let the already-queued PCM play out before the DAC is muted and the route
+ * is changed.  Muting at the first empty producer read discarded the ring's
+ * last periods, which is what truncated an isolated cue; the wait is bounded
+ * by the ring's duration plus one period so a stalled DMA cannot hang the
+ * teardown.  pcm_get_htimestamp() reports the ring's free frames.
+ */
+static void drain_output_pcm(struct pcm *pcm)
+{
+	unsigned int buffer_frames;
+	long long budget_us;
+	long long waited_us = 0;
+
+	if (!pcm || !pcm_is_ready(pcm))
+		return;
+	buffer_frames = pcm_get_buffer_size(pcm);
+	if (buffer_frames == 0)
+		return;
+	budget_us = ((long long)buffer_frames + PERIOD_SIZE) * 1000000LL /
+		    DEFAULT_RATE;
+	while (waited_us < budget_us) {
+		struct timespec stamp;
+		unsigned int avail = 0;
+
+		if (pcm_get_htimestamp(pcm, &avail, &stamp) != 0 ||
+		    avail >= buffer_frames)
+			break;
+		usleep(OUTPUT_DRAIN_SLICE_US);
+		waited_us += OUTPUT_DRAIN_SLICE_US;
+	}
+}
+
 static int run_engine(const char *root, unsigned int card, unsigned int device)
 {
 	struct pcm_config config = {
@@ -3215,6 +3307,18 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		g_output_start_due_ns = 0;
 		airplay_delay_publish(NULL, sources);
 		SENDSPIN_TRACE("close");
+		/* Play the queued ring out before the DAC mute and route change
+		 * below cut it off: flush the producer's sub-period remainder,
+		 * then wait for the PCM to drain.  A Sendspin generation owns
+		 * its own pacing and stays out of the legacy tail path. */
+		if (!stopping && !g_sendspin.have_generation &&
+		    !sendspin_live(&g_sendspin) && !sendspin_held(&g_sendspin))
+			(void)play_partial_tail(sources, pcm, output, &dynamics,
+						&speaker, &reference,
+						logical_master_volume(root),
+						&master_gain);
+		if (!stopping)
+			drain_output_pcm(pcm);
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
 		sendspin_close_timing(&g_sendspin);
