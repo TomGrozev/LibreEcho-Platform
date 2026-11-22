@@ -261,6 +261,30 @@ start_daemon_service()
     return 1
 }
 
+preserve_failure_logs()
+{
+    # A candidate boot that misses the OTA confirm gate is rolled back, and
+    # /tmp with the first-boot service logs goes with it. Keep the evidence on
+    # /data so the next attempt can be diagnosed.
+    service=$1
+    log_dir=${DATA_ROOT:-/data}/libreecho/logs
+    $BB mkdir -p "$log_dir" 2>/dev/null || return 0
+    boot=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null | $BB cut -c 1-8)
+    [ -n "$boot" ] || boot=unknown
+    dest=$log_dir/libreecho-$service-start-$boot.log
+    {
+        printf 'service=%s\nboot_id=%s\n' "$service" "$boot"
+        printf '### init log\n'
+        $BB cat /tmp/init.log 2>/dev/null
+        printf '### reconcile log\n'
+        $BB cat /tmp/libreecho-"$service".reconcile.log 2>/dev/null
+        printf '### daemon log\n'
+        $BB cat /var/log/libreecho-"$service".log 2>/dev/null
+    } >"$dest" 2>/dev/null || return 0
+    log "feature-reconcile-failure-log-saved:$service:$dest"
+    return 0
+}
+
 airplay_explicitly_disabled()
 {
     config=$DATA_ROOT/libreecho/config/web-config.json
@@ -297,7 +321,7 @@ reconcile_topology()
         # esphomed announce action speak through the local TTS socket.
         stop_service agentd "$RUN_ROOT/libreecho/agent.sock" || return 1
         stop_service sttd "$RUN_ROOT/libreecho/stt.sock" || return 1
-        start_daemon_service esphomed || return 1
+        start_daemon_service esphomed || { preserve_failure_logs esphomed; return 1; }
     else
         stop_service esphomed || return 1
     fi
@@ -381,6 +405,7 @@ start_feature()
     rc=$?
     if [ "$rc" -ne 0 ]; then
         log "feature-reconcile-service-start-failed:$service:$rc"
+        preserve_failure_logs "$service"
         return 1
     fi
 
@@ -409,11 +434,18 @@ reconcile()
         return 0
     fi
     select_topology || return 1
-    reconcile_topology || {
+    topology_failed=0
+    if ! reconcile_topology; then
+        # The voice topology (agentd/sttd/ttsd/esphomed) is independent of the
+        # playback graph: airplayd and its engine must still come up when a
+        # voice daemon misses its start window. Stopping here left the OTA
+        # confirm probe without a feature service and rolled a healthy
+        # candidate back.
+        topology_failed=1
         log feature-service-topology-reconcile-failed
-        return 1
-    }
-    failed=0
+        log feature-services-continued-after-topology-failure
+    fi
+    failed=$topology_failed
     for feature in $persisted_features; do
         start_feature "$feature" || failed=1
     done
