@@ -127,6 +127,9 @@ ensure_chr /dev/urandom 1 9
 ensure_chr /dev/console 5 1
 ensure_chr /dev/tty 5 0
 ensure_chr /dev/ptmx 5 2
+# log() and adbd diagnostics write kernel messages; without the node the
+# redirection fails and the UART record, the only record on this device, is lost.
+ensure_chr /dev/kmsg 1 11
 $BB chmod 0666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom
 $BB chmod 0600 /dev/console
 $BB chmod 0666 /dev/tty /dev/ptmx
@@ -849,7 +852,11 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
         $BB ln -s "$G/functions/ffs.adb" "$G/configs/c.1/ffs.adb"
     log configfs-adb-composition-created
 
-    if $BB mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb 2>/tmp/functionfs.log; then
+    # no_disconnect keeps the gadget bound when adbd closes FunctionFS between
+    # transports.  Without it f_fs clears the UDC on the last close, D+ drops
+    # without a host reset and the device never enumerates again until reboot.
+    # f_fs declares it fsparam_bool, which rejects a bare flag: it needs "=1".
+    if $BB mount -t functionfs -o uid=2000,gid=2000,no_disconnect=1 adb /dev/usb-ffs/adb 2>/tmp/functionfs.log; then
         log functionfs-mounted
         # Linux 6.1 is built with DAC as its security model and has no SELinux
         # filesystem.  Passing Android's root_seclabel makes this static adbd
@@ -899,6 +906,28 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
                         log "usb-role-pin-failed:${role_sx#/sys/class/usb_role/}"
                     fi
                 done
+                # no_disconnect should keep the gadget bound, but a host reset
+                # or a failed transport switch still clears the UDC, and this
+                # script binds it only once.  Android init rebinds on
+                # sys.usb.ffs.ready; do the same from a detached poller so the
+                # only recovery transport does not depend on the next reboot.
+                # The rebind needs adbd alive with both FunctionFS endpoints
+                # present, exactly the devlog.sh REBIND condition.
+                (
+                    while $BB kill -0 "$adbd_pid" 2>/dev/null; do
+                        if [ -z "$($BB cat "$G/UDC" 2>/dev/null)" ] &&
+                           [ -e /dev/usb-ffs/adb/ep1 ] &&
+                           [ -e /dev/usb-ffs/adb/ep2 ]; then
+                            if echo "$udc" > "$G/UDC" 2>/dev/null; then
+                                log "udc-rebound:$udc"
+                            else
+                                log "udc-rebind-failed:$udc"
+                            fi
+                        fi
+                        $BB sleep 1
+                    done
+                    log udc-rebind-supervisor-exit
+                ) &
                 # Capture one bounded userspace snapshot after the host has had
                 # time to send CNXN.  Never loop: repeated ADB reconnects would
                 # otherwise flood the authoritative UART record.

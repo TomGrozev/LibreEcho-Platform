@@ -3228,7 +3228,11 @@ start_feature_service_if_enabled
         self.assertIn("mount -t configfs configfs /sys/kernel/config", source)
         self.assertIn("functions/ffs.adb", source)
         self.assertIn("configs/c.1/ffs.adb", source)
-        self.assertIn("mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb", source)
+        self.assertIn(
+            "mount -t functionfs -o uid=2000,gid=2000,no_disconnect=1 "
+            "adb /dev/usb-ffs/adb",
+            source,
+        )
         self.assertIn("configfs-mounted", source)
         self.assertIn("functionfs-mounted", source)
         self.assertIn("adbd-started:", source)
@@ -3252,6 +3256,29 @@ start_feature_service_if_enabled
         self.assertLess(ffs_mount, adbd)
         self.assertLess(adbd, endpoints)
         self.assertLess(endpoints, bind)
+
+    def test_adb_transport_survives_ffs_close_with_detached_udc_rebind(self) -> None:
+        source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("ensure_chr /dev/kmsg 1 11", source)
+        self.assertLess(
+            source.index("ensure_chr /dev/kmsg 1 11"), source.index("\nlog()\n")
+        )
+        # f_fs clears the UDC when adbd closes it unless no_disconnect is set;
+        # its fsparam_bool rejects the bare flag, so the value is required.
+        self.assertIn(",no_disconnect=1 adb /dev/usb-ffs/adb", source)
+        bind = source.index('> "$G/UDC"', source.index("/dev/usb-ffs/adb/ep1"))
+        supervisor = source.index('while $BB kill -0 "$adbd_pid"', bind)
+        self.assertLess(bind, supervisor)
+        opener = source.rindex("(", 0, supervisor)
+        self.assertEqual(source[opener:opener + 1], "(")
+        self.assertIn(") &", source[opener:])
+        block = source[opener:source.index(") &", opener)]
+        self.assertIn('echo "$udc" > "$G/UDC"', block)
+        self.assertIn('[ -e /dev/usb-ffs/adb/ep1 ]', block)
+        self.assertIn('[ -e /dev/usb-ffs/adb/ep2 ]', block)
+        self.assertIn('$BB sleep 1', block)
+        self.assertIn('log "udc-rebound:$udc"', block)
+        self.assertIn('log "udc-rebind-failed:$udc"', block)
 
     def test_production_pipeline_requires_full_mt8163_hardware_closure(self) -> None:
         """Regression: a generic FunctionFS kernel must not pass as MT8163-ready."""
