@@ -8,9 +8,13 @@ import hashlib
 import json
 import lzma
 import re
+import shlex
+import shutil
 import stat
 import struct
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -1292,6 +1296,105 @@ def validate_target_identity(entries: dict[str, Entry], manifest: dict[str, obje
     require_member(entries, "etc/libreecho/audio-profile", profile_hash, 0o644)
     if manifest.get("audio_profile", {}).get("sha256") != profile_hash:
         fail("image audio profile manifest mismatch")
+
+
+TARGET_IDENTITY_PARSERS = (
+    ("libreecho-init", "init", "load_image_target"),
+    ("libreecho-update", "usr/local/sbin/libreecho-update", "load_image_target"),
+    ("libreecho-target-manifest", "usr/local/sbin/libreecho-target-manifest",
+     "load_image_target"),
+    ("libreecho-update-fetch", "usr/local/sbin/libreecho-update-fetch",
+     "load_fetch_target"),
+)
+
+
+def shell_function(text: str, name: str) -> str:
+    match = re.search(rf"(?ms)^{re.escape(name)}\(\)\n\{{.*?^\}}", text)
+    if match is None:
+        fail(f"image target parser function is missing: {name}")
+    return match.group(0)
+
+
+def validate_target_identity_parsers(entries: dict[str, Entry], init_data: bytes) -> None:
+    """Every in-image target parser must map the image's own target id.
+
+    v0.2.30 booted with an intact /etc/libreecho/target but no lidar case in
+    libreecho-init's loader, so the slot ran without Wi-Fi. Run each shipped
+    parser against the built image's target file, and require the Lidar radio
+    bring-up path and its health gate.
+    """
+    errors: list[str] = []
+    if b"lidar_radio_bringup" not in init_data:
+        errors.append("Lidar Wi-Fi bring-up path is missing from libreecho-init")
+    if b"last_check=wifi-radio" not in init_data:
+        errors.append("Lidar wifi-radio health gate is missing from libreecho-init")
+    target_entry = entries.get("etc/libreecho/target")
+    busybox_entry = entries.get("bin/busybox")
+    qemu = shutil.which("qemu-arm-static")
+    host_busybox = shutil.which("busybox") or (
+        "/bin/busybox" if Path("/bin/busybox").is_file() else None)
+    if target_entry is None:
+        errors.append("image target file is missing")
+    if qemu is None and host_busybox is None:
+        errors.append("no busybox sh available to exercise the image target parsers")
+    if qemu is not None and busybox_entry is None:
+        errors.append("image busybox is missing")
+    if errors and (target_entry is None or (qemu is None and host_busybox is None)):
+        fail("\n".join(errors))
+    assert target_entry is not None
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        target_file = root / "target"
+        target_file.write_bytes(target_entry.data)
+        if qemu is not None and busybox_entry is not None:
+            image_busybox = root / "busybox"
+            image_busybox.write_bytes(busybox_entry.data)
+            image_busybox.chmod(0o755)
+            loader_entry = entries.get("lib/ld-musl-armhf.so.1")
+            if loader_entry is None:
+                fail("image musl loader is missing")
+            (root / "lib").mkdir()
+            (root / "lib/ld-musl-armhf.so.1").write_bytes(loader_entry.data)
+            command = [qemu, "-L", str(root), str(image_busybox)]
+            bb = (shlex.quote(qemu) + " -L " + shlex.quote(str(root)) + " "
+                  + shlex.quote(str(image_busybox)))
+        else:
+            assert host_busybox is not None
+            command = [host_busybox]
+            bb = shlex.quote(host_busybox)
+        script = root / "parser.sh"
+        for label, member, function_name in TARGET_IDENTITY_PARSERS:
+            entry = entries.get(member)
+            if entry is None:
+                errors.append(f"image target parser is missing: {label}")
+                continue
+            invoke = ("TARGET_ID=; TARGET_SLUG=\n"
+                      f"{function_name} || exit 3\n"
+                      + ("printf '%s\\n' \"$TARGET_SLUG\"\n" if function_name == "load_fetch_target"
+                         else "printf '%s %s\\n' \"$TARGET_ID\" \"$TARGET_SLUG\"\n"))
+            try:
+                body = shell_function(entry.data.decode("utf-8", "replace"), function_name)
+            except SystemExit as exc:
+                errors.append(str(exc))
+                continue
+            # Point the bounded loader at the built image's own target file.
+            body = body.replace("/etc/libreecho/target", shlex.quote(str(target_file)))
+            script.write_text(
+                "BB=" + shlex.quote(bb) + "\n"
+                "TARGET_FILE=" + shlex.quote(str(target_file)) + "\n"
+                "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+                "log() { :; }\n"
+                + body + "\n" + invoke + "\n"
+            )
+            result = subprocess.run([*command, "sh", str(script)],
+                                    capture_output=True, text=True)
+            expected = "lidar" if function_name == "load_fetch_target" else "lidar lidar"
+            if result.returncode != 0 or result.stdout.strip() != expected:
+                errors.append(f"image target parser does not map lidar: {label} "
+                              f"(rc={result.returncode}, out={result.stdout.strip()!r}, "
+                              f"err={result.stderr.strip()!r})")
+    if errors:
+        fail("\n".join(errors))
 
 
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],

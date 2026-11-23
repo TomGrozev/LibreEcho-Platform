@@ -204,6 +204,33 @@ jobs:
             ota/test_release_source.py \
             test_active_device_ping.py
 
+      - name: Run Lidar ARM64 image, DTB and install suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The Lidar image contract compiles synthetic DTBs with dtc and stages
+          # synthetic firmware fixtures, so none of these cases may skip.  A
+          # skip is a lost contract: the greps below require the positive
+          # cases to report `ok`.
+          ( cd tools/mt8167-arm64 \
+            && python -m unittest -v test_recovery_image_tools test_verify_lidar_dtb ) \
+            2>&1 | tee "$RUNNER_TEMP/lidar-image.log"
+          for case in \
+            test_round_trip_passes_independent_verifier \
+            test_add_lidar_wifi_firmware_stages_both_driver_names \
+            test_valid_tree; do
+            grep -q "$case .* ok" "$RUNNER_TEMP/lidar-image.log" || {
+              echo "ERROR: $case did not run; the Lidar image/DTB contract must not silently skip" >&2
+              exit 1
+            }
+          done
+          # install/ and prepare/ carry no __init__.py, so each suite runs from
+          # its own directory.
+          for suite in install prepare; do
+            ( cd "tools/mt8167-arm64/$suite" && python -m unittest -v ) \
+              2>&1 | tee "$RUNNER_TEMP/lidar-$suite.log"
+          done
+
       - name: Run pinned Opus decode provenance suites
         shell: bash
         env:
@@ -251,6 +278,20 @@ jobs:
             tools/mt8163-arm32/ota-test-vm/parse_profile.py \
             tools/mt8163-arm32/build_recovery_image.py \
             tools/mt8163-arm32/verify_recovery_image.py \
+            tools/mt8167-arm64/libreecho_platform_targets.py \
+            tools/mt8167-arm64/build_recovery_image.py \
+            tools/mt8167-arm64/verify_recovery_image.py \
+            tools/mt8167-arm64/verify_lidar_dtb.py \
+            tools/mt8167-arm64/test_recovery_image_tools.py \
+            tools/mt8167-arm64/test_verify_lidar_dtb.py \
+            tools/mt8167-arm64/install/expdb_guard.py \
+            tools/mt8167-arm64/install/fake_fastboot.py \
+            tools/mt8167-arm64/install/lidar_backup_set.py \
+            tools/mt8167-arm64/install/lidar_install.py \
+            tools/mt8167-arm64/prepare/capture_stock_gbls.py \
+            tools/mt8167-arm64/prepare/lidar_donor_artifacts.py \
+            tools/mt8167-arm64/prepare/lidar_prepare.py \
+            tools/mt8167-arm64/prepare/mtk_adapter.py \
             tools/mt8163-arm32/ota/make_ota_bundle.py \
             tools/mt8163-arm32/ota/feature_manifest.py \
             tools/mt8163-arm32/feature_runtime/package_runtime.py \
