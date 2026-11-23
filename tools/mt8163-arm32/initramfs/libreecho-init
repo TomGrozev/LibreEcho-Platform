@@ -3658,7 +3658,16 @@ ota_health_confirm_worker()
         while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
             attempt=$((attempt + 1))
             probe_ok=1
-            if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
+            if [ "${TARGET_ID:-}" = lidar ] && [ ! -e /sys/class/net/wlan0 ]; then
+                # Lidar's Wi-Fi radio is part of the recovery plane: without the
+                # interface the slot has no management transport even though adb
+                # over USB and the local web plane look healthy. Only the radio
+                # is required, not an association, so a router outage cannot
+                # roll a good slot back; this gate ignores
+                # HEALTH_STRICT_SERVICES.
+                last_check=wifi-radio
+                probe_ok=0
+            elif ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
                 last_check=data-mount
                 probe_ok=0
             elif [ "$adbd_tcp_configured" -eq 1 ] && ! adb_tcp_ready; then

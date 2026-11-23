@@ -43,6 +43,21 @@ class Issue169HealthContracts(unittest.TestCase):
         self.assertIn("last_check=startup-ready", self.init)
         self.assertNotIn("# before making the slot permanent.\n    $BB sleep 45", self.init)
 
+    def test_lidar_slot_confirmation_requires_the_wifi_radio(self) -> None:
+        worker = shell_function(self.init, "ota_health_confirm_worker")
+        gate = ('if [ "${TARGET_ID:-}" = lidar ] && '
+                '[ ! -e /sys/class/net/wlan0 ]; then')
+        self.assertIn(gate, worker)
+        self.assertIn("last_check=wifi-radio", worker)
+        # The radio is part of the recovery plane, so the gate must sit inside
+        # the probe chain ahead of /data and must not consult the strict flag.
+        self.assertLess(worker.index(gate), worker.index("last_check=data-mount"))
+        condition = gate
+        self.assertNotIn("HEALTH_STRICT_SERVICES", condition)
+        # An association is not required: only the interface's existence.
+        self.assertNotIn(" wlan0 ", condition)
+        self.assertNotIn("iw ", condition)
+
     def test_pstore_and_dynamic_pmsg_are_prepared(self) -> None:
         self.assertIn("setup_pstore()", self.init)
         self.assertIn('$BB mount -t pstore pstore "$pstore_dir"', self.init)
