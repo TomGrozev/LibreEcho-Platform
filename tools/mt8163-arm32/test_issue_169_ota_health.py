@@ -43,6 +43,15 @@ class Issue169HealthContracts(unittest.TestCase):
         self.assertIn("last_check=startup-ready", self.init)
         self.assertNotIn("# before making the slot permanent.\n    $BB sleep 45", self.init)
 
+    def test_slot_confirmation_rejects_an_unmapped_target_identity(self) -> None:
+        worker = shell_function(self.init, "ota_health_confirm_worker")
+        gate = "if ! load_image_target; then"
+        self.assertIn(gate, worker)
+        self.assertIn("last_check=target-identity", worker)
+        # Any target, and ahead of the lidar-only radio gate.
+        self.assertLess(worker.index(gate), worker.index("last_check=wifi-radio"))
+        self.assertLess(worker.index(gate), worker.index('last_check=data-mount'))
+
     def test_lidar_slot_confirmation_requires_the_wifi_radio(self) -> None:
         worker = shell_function(self.init, "ota_health_confirm_worker")
         gate = ('if [ "${TARGET_ID:-}" = lidar ] && '

@@ -3658,7 +3658,14 @@ ota_health_confirm_worker()
         while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
             attempt=$((attempt + 1))
             probe_ok=1
-            if [ "${TARGET_ID:-}" = lidar ] && [ ! -e /sys/class/net/wlan0 ]; then
+            if ! load_image_target; then
+                # /etc/libreecho/target names a target this parser cannot map
+                # (the v0.2.30 lidar break). A slot whose identity cannot be
+                # resolved must never become permanent, whatever the rest of
+                # the recovery plane reports.
+                last_check=target-identity
+                probe_ok=0
+            elif [ "${TARGET_ID:-}" = lidar ] && [ ! -e /sys/class/net/wlan0 ]; then
                 # Lidar's Wi-Fi radio is part of the recovery plane: without the
                 # interface the slot has no management transport even though adb
                 # over USB and the local web plane look healthy. Only the radio
