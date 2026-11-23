@@ -86,6 +86,7 @@ hardware()
     case $(value_of target_id "$TARGET_FILE") in
         radar_puffin) echo radar ;;
         biscuit) echo biscuit ;;
+        lidar) echo lidar ;;
         *) return 1 ;;
     esac
 }

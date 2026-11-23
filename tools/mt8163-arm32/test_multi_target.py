@@ -275,6 +275,50 @@ class RuntimeTargetTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('manifest-soc', result.stderr)
 
+    def test_every_builder_target_id_maps_in_every_identity_parser(self):
+        parsers = [
+            ('initramfs/libreecho-init', 'load_image_target'),
+            ('initramfs/libreecho-update', 'load_image_target'),
+            ('initramfs/libreecho-target-manifest', 'load_image_target'),
+            ('initramfs/libreecho-update-fetch', 'load_fetch_target'),
+            ('initramfs/libreecho-ping', 'hardware'),
+        ]
+        identities = [('radar_puffin', 'radar-puffin', 'radar'),
+                      ('biscuit', 'biscuit', 'biscuit'),
+                      ('lidar', 'lidar', 'lidar')]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); target = root / 'target'
+            for identity, slug, hardware in identities:
+                target.write_text('target_id=' + identity + '\n')
+                for name, function_name in parsers:
+                    source = (TOOLS / name).read_text()
+                    body = function(source, function_name)
+                    body = body.replace('/etc/libreecho/target', shlex.quote(str(target)))
+                    if function_name == 'hardware':
+                        invoke = 'hw=$(hardware) || exit 3\nprintf \'%s\\n\' "$hw"'
+                        expected = hardware
+                    elif function_name == 'load_fetch_target':
+                        invoke = ('TARGET_SLUG=\nload_fetch_target || exit 3\n'
+                                  'printf \'%s\\n\' "$TARGET_SLUG"')
+                        expected = slug
+                    else:
+                        invoke = ('TARGET_ID=; TARGET_SLUG=\n'
+                                  'load_image_target || exit 3\n'
+                                  'printf \'%s %s\\n\' "$TARGET_ID" "$TARGET_SLUG"')
+                        expected = identity + ' ' + slug
+                    script = root / 'parser.sh'
+                    script.write_text(
+                        'BB=/bin/busybox\nTARGET_FILE=' + shlex.quote(str(target)) + '\n'
+                        'die() { echo "$*" >&2; exit 1; }\nlog() { :; }\n'
+                        'value_of() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }\n'
+                        + body + '\n' + invoke + '\n')
+                    result = subprocess.run(['/bin/busybox', 'sh', str(script)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0,
+                                     f'{name}:{function_name} {identity}: {result.stderr}')
+                    self.assertEqual(result.stdout.strip(), expected,
+                                     f'{name}:{function_name} {identity}')
+
     def test_fetch_target_identity_accepts_lidar_and_refuses_unknown(self):
         source = (TOOLS / 'initramfs/libreecho-update-fetch').read_text()
         body = function(source, 'load_fetch_target')
