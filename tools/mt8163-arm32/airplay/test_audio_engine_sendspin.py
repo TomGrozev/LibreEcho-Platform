@@ -1235,6 +1235,7 @@ struct engine_log {
     uint32_t magic;
     uint32_t count;
     uint32_t audit_denied;
+    uint32_t audit_led;      /* subset of audit_denied: LED socket connects */
     uint32_t rt_underruns;
     struct ev ev[EV_MAX];
 };
@@ -1244,6 +1245,7 @@ struct engine_log {
 static struct ev g_ev[EV_MAX];
 static int g_ev_n;
 static int g_audit_denied;
+static int g_audit_led;
 static uint32_t g_rt_underruns;   /* real-time ring ran dry before a write */
 static int g_slow_unmute_pending; /* SCEN_RTSTART: one hardware-like mixer stall */
 static char g_root[700];
@@ -1328,6 +1330,10 @@ static void record_denied(uint32_t kind, const char *path)
     if (n > 0u) memcpy(&b, path, n > 4u ? 4u : n);
     if (n > 4u) memcpy(&c, path + 4u, n > 8u ? 4u : n - 4u);
     g_audit_denied += 1;
+    /* Subset: the LED socket is the engine's intended output path, so it is
+     * logged and counted here but is not an "unexpected external path". */
+    if (kind == 2u && path && strcmp(path, LED_SOCKET) == 0)
+        g_audit_led += 1;
     logev(T_AUDIT_DENY, kind, b, c, (int32_t)n);
 }
 
@@ -1901,6 +1907,7 @@ static void dump_log(const char *root, int rc)
     out->magic = LOG_MAGIC;
     out->count = (uint32_t)g_ev_n;
     out->audit_denied = (uint32_t)g_audit_denied;
+    out->audit_led = (uint32_t)g_audit_led;
     out->rt_underruns = g_rt_underruns;
     memcpy(out->ev, g_ev, sizeof(struct ev) * (size_t)g_ev_n);
     (void)snprintf(path, sizeof(path), "%s/engine.log", root);
@@ -1921,6 +1928,7 @@ static void child_main(const char *root, int scen, int ev_w, int ctl_r)
     g_scen = scen;
     g_ev_n = 0;
     g_audit_denied = 0;
+    g_audit_led = 0;
     g_ev_fd = ev_w;
     g_ctl_fd = ctl_r;
     (void)snprintf(g_root, sizeof(g_root), "%s", root);
@@ -2529,7 +2537,7 @@ static void scen_prime(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "prime: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "prime: the loop reached an external /sys /dev /run /data path");
     writes = count_tag(T_PCM_WRITE);
     check(count_tag(T_PCM_OPEN) == 1, "prime: PCM was not opened exactly once");
@@ -2606,7 +2614,7 @@ static void scen_finish(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "finish: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "finish: the loop reached an external /sys /dev /run /data path");
     check(count_tag(T_PCM_OPEN) == 1 && count_tag(T_PCM_CLOSE) == 1,
           "finish: PCM did not open/close once");
@@ -3146,7 +3154,7 @@ static void scen_notiming(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "notiming: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "notiming: the loop reached an external /sys /dev /run /data path");
     writes = count_tag(T_PCM_WRITE);
     check(writes >= 1,
@@ -3295,7 +3303,7 @@ static void scen_queryfail(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "queryfail: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "queryfail: the loop reached an external /sys /dev /run /data path");
     writes = count_tag(T_PCM_WRITE);
     check(writes >= 1, "queryfail: no PCM period was written");
@@ -3364,7 +3372,7 @@ static void scen_wide_finish(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "widefinish: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "widefinish: the loop reached an external /sys /dev /run /data path");
     check(count_tag(T_PCM_WIDE_REJECT) == 0 && count_tag(T_PCM_WIDE_OPEN) == 1,
           "widefinish: the PCM was not opened S32_LE exactly once");
@@ -3493,7 +3501,7 @@ static void scen_throughput(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "throughput: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "throughput: the loop reached an external /sys /dev /run /data path");
 }
 
@@ -3545,7 +3553,7 @@ static void scen_rtstart(const char *base)
         fprintf(stderr, "rtstart: %u underrun(s)\n", (unsigned)g_log.rt_underruns);
     check(g_log.rt_underruns == 0u,
           "rtstart: a fed Sendspin session let the S32 ring run dry after start");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "rtstart: the loop reached an external /sys /dev /run /data path");
 }
 
@@ -3604,7 +3612,7 @@ static void scen_idlewake(const char *base)
     }
     (void)finish_child(pid, ev, ctl);
     check(load_log(root) == 0, "idlewake: engine log missing");
-    check(g_log.audit_denied == 0u,
+    check(g_log.audit_denied == g_log.audit_led,
           "idlewake: the loop reached an external /sys /dev /run /data path");
 }
 
@@ -3613,6 +3621,80 @@ static void scen_wide_epipe(const char *base)
     scen_xrun(base, SCEN_WIDE_EPIPE, 'F', "wideepipe");
     checkf("wideepipe", "recovery did not reopen the PCM as S32_LE",
            count_tag(T_PCM_WIDE_OPEN) >= 2 && count_tag(T_PCM_WIDE_REJECT) == 0);
+}
+
+/* True when the engine's atomically published status file holds `needle`. */
+static int status_contains(const char *root, const char *needle)
+{
+    char path[700], buffer[512];
+    int fd, n;
+
+    if (snprintf(path, sizeof(path), "%s/status.json", root) >=
+        (int)sizeof(path))
+        return 0;
+    fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    n = (int)read(fd, buffer, sizeof(buffer) - 1u);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buffer[n] = '\0';
+    return strstr(buffer, needle) != NULL;
+}
+
+/* Scenario: a Sendspin-only stream must be reported as media playback by the
+ * engine's status file and must drive the music visualizer.  Neither path may
+ * consult only the producer FIFOs: Sendspin stages straight into the renderer,
+ * so a Sendspin-only stream used to publish "idle" and never animate the LEDs. */
+static void scen_sendspin_media(const char *base)
+{
+    char root[600];
+    char sock[700];
+    pid_t pid;
+    int ev, ctl, fd, i;
+    uint32_t epoch = 0, status = 0;
+    int16_t value = -12000;
+
+    make_root(base, "sendspinmedia", root, sizeof(root));
+    (void)snprintf(sock, sizeof(sock), "%s/sendspin.sock", root);
+    if (spawn(root, SCEN_MEDIA, &pid, &ev, &ctl) != 0) {
+        check(0, "sendspinmedia: spawn failed");
+        return;
+    }
+    fd = connect_client(sock, 3000);
+    check(fd >= 0, "sendspinmedia: connect failed");
+    if (fd >= 0) {
+        check(cl_open(fd, 1u, &epoch, &status) == 0 && status == 0u,
+              "sendspinmedia: OPEN failed");
+        for (i = 0; i < 3; ++i) {
+            checkf("sendspinmedia", "DATA was not credited",
+                   cl_data(fd, epoch, 1u, (uint32_t)i,
+                           (uint64_t)i * PERIOD_SIZE, PERIOD_SIZE, value,
+                           1) == 0);
+            value = (int16_t)-value;
+        }
+        check(wait_event(ev, 'W', 8000) == 0,
+              "sendspinmedia: the Sendspin period never reached the PCM");
+        for (i = 0; i < 200 && !status_contains(root, "\"media\":true"); ++i) {
+            struct timespec ts = {0, 10000000L};
+            nanosleep(&ts, NULL);
+        }
+        check(status_contains(root, "\"media\":true"),
+              "sendspinmedia: status.json did not report the media bus");
+        check(status_contains(root, "\"state\":\"playing\""),
+              "sendspinmedia: status.json did not report playing");
+        check(status_contains(root, "\"active\":\"media\""),
+              "sendspinmedia: status.json did not name media as active");
+        close(fd);
+    }
+    (void)finish_child(pid, ev, ctl);
+    check(load_log(root) == 0, "sendspinmedia: engine log missing");
+    check(count_audit_kind(2u) >= 1,
+          "sendspinmedia: the music visualizer LED frame path was never exercised");
+    check(count_negative_samples() > 0u,
+          "sendspinmedia: Sendspin audio did not reach the rendered period");
+    check(count_tag(T_PCM_WRITE) >= 1, "sendspinmedia: no PCM period written");
 }
 
 struct loop_scenario {
@@ -3633,6 +3715,7 @@ static const struct loop_scenario g_loop_scenarios[] = {
     { "prepfail", scen_prepfail },
     { "stop", scen_stop },
     { "media", scen_media },
+    { "sendspinmedia", scen_sendspin_media },
     { "pcmfail", scen_pcmfail },
     { "notiming", scen_notiming },
     { "notiminglegacy", scen_notiming_legacy },

@@ -87,7 +87,7 @@ static void analyse_at(int32_t gain, struct music_features *features,
 		for (i = 0; i < PERIOD_SIZE * OUTPUT_CHANNELS; ++i)
 			if (abs(output[i]) > *output_peak)
 				*output_peak = abs(output[i]);
-		music_analysis_period(sources, analysis);
+		music_analysis_period(sources, NULL, 0, analysis);
 		CHECK(memcmp(analysis, media, sizeof(media)) == 0);
 		audio_visualizer_process_features(&analyzer, analysis,
 						  PERIOD_SIZE, INPUT_CHANNELS,
@@ -124,21 +124,40 @@ int main(void)
 	ready_bus(&sources[SOURCE_MEDIA], media, 0);
 	ready_bus(&sources[SOURCE_AIRPLAY], airplay, 32768);
 	sources[SOURCE_AIRPLAY].airplay_volume_missing = 1;
-	music_analysis_period(sources, analysis);
+	music_analysis_period(sources, NULL, 0, analysis);
 	for (i = 0; i < TAP_SAMPLES; ++i)
 		CHECK(analysis[i] == 0);
 
 	/* 3. Media and AirPlay are summed and saturate at full scale. */
 	sources[SOURCE_MEDIA].gain_q15 = 16384;
 	sources[SOURCE_AIRPLAY].airplay_volume_missing = 0;
-	music_analysis_period(sources, analysis);
+	music_analysis_period(sources, NULL, 0, analysis);
 	for (i = 0; i < TAP_SAMPLES; ++i)
 		CHECK(analysis[i] == 31000);
 	for (i = 0; i < TAP_SAMPLES; ++i)
 		media[i] = 5000;
-	music_analysis_period(sources, analysis);
+	music_analysis_period(sources, NULL, 0, analysis);
 	for (i = 0; i < TAP_SAMPLES; ++i)
 		CHECK(analysis[i] == 32767);
+
+	/* 4. The Sendspin stage is media-class: it is analysed at unity even
+	 * though it never passes through a producer FIFO. */
+	{
+		static int16_t stage[TAP_SAMPLES];
+
+		for (i = 0; i < TAP_SAMPLES; ++i)
+			stage[i] = 4000;
+		memset(sources, 0, sizeof(sources));
+		music_analysis_period(sources, stage, PERIOD_SIZE, analysis);
+		for (i = 0; i < TAP_SAMPLES; ++i)
+			CHECK(analysis[i] == 4000);
+		for (i = 0; i < TAP_SAMPLES; ++i)
+			stage[i] = 30000;
+		ready_bus(&sources[SOURCE_MEDIA], media, 32768);
+		music_analysis_period(sources, stage, PERIOD_SIZE, analysis);
+		for (i = 0; i < TAP_SAMPLES; ++i)
+			CHECK(analysis[i] == 32767);
+	}
 
 	if (failures)
 		return 1;

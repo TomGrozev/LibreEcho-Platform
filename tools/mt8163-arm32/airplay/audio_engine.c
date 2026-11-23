@@ -324,6 +324,18 @@ static int sendspin_held(const struct sendspin_state *sp)
 }
 
 /*
+ * Sendspin is a media-class source that skips the producer FIFOs: its frames
+ * are staged straight from the framed sink into render_period().  Everything
+ * that observes "media" through a source bus (the published playback status
+ * and the music analysis tap) therefore has to ask the sink as well, or a
+ * Sendspin-only stream reports idle and never animates the LEDs.
+ */
+static int sendspin_media_active(void)
+{
+    return sendspin_live(&g_sendspin);
+}
+
+/*
  * Peek the queued source frames for the current period (non-consuming).
  *
  * A generation's first source frame waits until a whole period is queued (or
@@ -1049,7 +1061,8 @@ static int source_period_ready(const struct source_bus *source);
  * bus at zero gain is left out so a muted sender does not animate the LEDs.
  */
 static void music_analysis_period(const struct source_bus *sources,
-				  int16_t *analysis)
+				  const int16_t *sendspin,
+				  size_t sendspin_frames, int16_t *analysis)
 {
 	static const unsigned int music_sources[] = {
 		SOURCE_MEDIA, SOURCE_AIRPLAY
@@ -1073,17 +1086,37 @@ static void music_analysis_period(const struct source_bus *sources,
 						     sum < -32768 ? -32768 : sum);
 		}
 	}
+	/* Sendspin never reaches a producer FIFO: render_period() mixes the
+	 * staged frames directly.  Analyse that same stage at unity so a
+	 * Sendspin-only programme drives the LED visualizer instead of being
+	 * measured as silence. */
+	if (sendspin && sendspin_frames > 0) {
+		size_t samples = sendspin_frames * OUTPUT_CHANNELS;
+
+		if (samples > PERIOD_SIZE * INPUT_CHANNELS)
+			samples = PERIOD_SIZE * INPUT_CHANNELS;
+		for (sample = 0; sample < samples; ++sample) {
+			int32_t sum = (int32_t)analysis[sample] +
+				sendspin[sample];
+
+			analysis[sample] = (int16_t)(sum > 32767 ? 32767 :
+						     sum < -32768 ? -32768 : sum);
+		}
+	}
 }
 
 static void process_music_visualizer(struct music_visualizer *visualizer,
-				     const struct source_bus *sources)
+				     const struct source_bus *sources,
+				     const int16_t *sendspin,
+				     size_t sendspin_frames)
 {
 	unsigned int band;
 	int audible = 0;
 
 	if (higher_priority_active(sources) ||
 	    (sources[SOURCE_MEDIA].received == 0 &&
-	     sources[SOURCE_AIRPLAY].received == 0)) {
+	     sources[SOURCE_AIRPLAY].received == 0 &&
+	     sendspin_frames == 0 && !sendspin_media_active())) {
 		stop_music_visualizer(visualizer);
 		return;
 	}
@@ -1097,7 +1130,8 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 	 */
 	(void)music_feature_transport_begin_tick(&visualizer->transport,
 						 music_visualizer_seed);
-	music_analysis_period(sources, visualizer->analysis);
+	music_analysis_period(sources, sendspin, sendspin_frames,
+			      visualizer->analysis);
 	audio_visualizer_process_features(&visualizer->analyzer,
 					  visualizer->analysis,
 					  PERIOD_SIZE, INPUT_CHANNELS,
@@ -1142,7 +1176,8 @@ static unsigned int source_activity_mask(const struct source_bus *sources)
 
 	if (sources[SOURCE_MEDIA].idle_periods > 0 ||
 	    (sources[SOURCE_AIRPLAY].idle_periods > 0 &&
-	     !sources[SOURCE_AIRPLAY].airplay_volume_missing))
+	     !sources[SOURCE_AIRPLAY].airplay_volume_missing) ||
+	    sendspin_media_active())
 		mask |= PLAYBACK_BUS_MEDIA;
 	if (sources[SOURCE_SYSTEM].idle_periods > 0)
 		mask |= PLAYBACK_BUS_SYSTEM;
@@ -1947,6 +1982,8 @@ static unsigned int ready_activity_mask(const struct source_bus *sources)
 		mask |= PLAYBACK_BUS_MEDIA;
 	if (source_period_ready(&sources[SOURCE_AIRPLAY]) &&
 	    !sources[SOURCE_AIRPLAY].airplay_volume_missing)
+		mask |= PLAYBACK_BUS_MEDIA;
+	if (sendspin_media_active())
 		mask |= PLAYBACK_BUS_MEDIA;
 	if (source_period_ready(&sources[SOURCE_SYSTEM]))
 		mask |= PLAYBACK_BUS_SYSTEM;
@@ -3205,7 +3242,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					      &visualizer, &status);
 			continue;
 		}
-		process_music_visualizer(&visualizer, sources);
+		process_music_visualizer(&visualizer, sources,
+					 g_sendspin.stage,
+					 g_sendspin.stage_frames);
 		consume_period(sources);
 		g_output_start_due_ns = 0;
 		airplay_delay_publish(pcm, sources);
@@ -3300,7 +3339,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				}
 			}
 			SENDSPIN_TRACE("period");
-			process_music_visualizer(&visualizer, sources);
+			process_music_visualizer(&visualizer, sources,
+					 g_sendspin.stage,
+					 g_sendspin.stage_frames);
 			consume_period(sources);
 			airplay_delay_publish(pcm, sources);
 		}
