@@ -768,6 +768,67 @@ class LidarImageTests(unittest.TestCase):
                          {'sha256': builder.sha256(profile), 'size': len(profile)})
         self.assertTrue(manifest['audio']['enabled'])
 
+    def test_thread_runtime_requires_the_radio_tool_and_agent_together(self):
+        parser = argparse.ArgumentParser()
+        args = argparse.Namespace(target='lidar', lidar_efr32=Path('efr32'),
+                                  otbr_agent=None)
+        with self.assertRaises(SystemExit):
+            builder.validate_lidar_radio_inputs(parser, args)
+        args = argparse.Namespace(target='radar_puffin', lidar_efr32=Path('efr32'),
+                                  otbr_agent=Path('agent'))
+        with self.assertRaises(SystemExit):
+            builder.validate_lidar_thread_inputs(parser, args)
+        args = argparse.Namespace(target='lidar', lidar_efr32=Path('efr32'),
+                                  otbr_agent=Path('agent'))
+        self.assertTrue(builder.validate_lidar_radio_inputs(parser, args))
+
+    def test_radio_helpers_stage_only_the_two_tools(self):
+        stage = self.directory / 'radio-stage'
+        stage.mkdir()
+        efr32 = self.directory / 'lidar-efr32'
+        agent = self.directory / 'otbr-agent'
+        efr32.write_bytes(b'efr32 tool')
+        agent.write_bytes(b'otbr agent')
+        manifest: dict[str, object] = {}
+        with mock.patch.object(builder.shared, 'require_elf_contract',
+                               return_value={}):
+            builder.add_lidar_radio_helpers(stage, manifest, efr32, agent)
+        for name, data in (('lidar-efr32', b'efr32 tool'),
+                           ('otbr-agent', b'otbr agent')):
+            member = stage / 'usr/local/sbin' / name
+            self.assertEqual(member.read_bytes(), data)
+            self.assertEqual(stat.S_IMODE(member.stat().st_mode), 0o755)
+            self.assertEqual(manifest['thread']['files'][name]['sha256'],
+                             builder.sha256(data))
+        self.assertEqual(sorted(path.name for path in stage.rglob('*') if path.is_file()),
+                         ['lidar-efr32', 'otbr-agent'])
+        self.assertFalse(any(path.suffix == '.gbl' for path in stage.rglob('*')))
+
+    def test_shared_overlay_never_stages_the_thread_runtime(self):
+        # Radar, Biscuit and Puffin share the sibling overlay and have no EFR32
+        # radio, so the Thread entry and its helpers stay out of that tree.
+        self.assertFalse((SIBLING_OVERLAY / 'libreecho-threadd').exists())
+        self.assertFalse(
+            (SIBLING_OVERLAY / 'etc/init.d/libreecho-threadd.init').exists())
+        self.assertFalse((SIBLING_OVERLAY / 'otbr-agent').exists())
+        self.assertFalse((SIBLING_OVERLAY / 'lidar-efr32').exists())
+
+    def test_thread_runtime_refuses_a_gbl_payload(self):
+        stage = self.directory / 'gbl-stage'
+        stage.mkdir()
+        gbl = self.directory / 'lidar-ot-rcp.gbl'
+        gbl.write_bytes(b'not an image payload')
+        tool = self.directory / 'tool'
+        tool.write_bytes(b'tool')
+        with self.assertRaises(builder.BuildError):
+            builder.add_lidar_radio_helpers(stage, {}, tool, gbl)
+        # Radar and Biscuit share the sibling overlay; it must not grow a
+        # radio helper path just because the Lidar builder exists.
+        self.assertFalse(hasattr(builder.shared, 'add_lidar_radio_helpers'))
+        overlay = builder.SIBLING / 'initramfs'
+        self.assertFalse((overlay / 'otbr-agent').exists())
+        self.assertFalse((overlay / 'lidar-efr32').exists())
+
     def test_add_lidar_wifi_firmware_stages_both_driver_names(self):
         stage = self.directory / 'wifi-stage'
         stage.mkdir()
