@@ -70,12 +70,14 @@ TARGETS = {
         'dtb_verifier': 'lidar',
         'soc': 'mt8167',
         'userspace_architecture': 'armv7',
-        # Flat codec, no analogue or digital gain: the MT8167 codec drives the
-        # speaker directly.  Playback is the stereo speaker PCM; capture is the
+        # The crossover, mono mix and amplifier enable live in the AIC32x4
+        # DAC and machine driver, so there is no software speaker DSP.  The
+        # codec's driver-gain index starts at -6 dB, so 6 is 0 dB, the stock
+        # speaker level.  Playback is the stereo speaker PCM; capture is the
         # 8-channel DMIC array; AEC is a separate stereo PCM.
         'audio': {
             'speaker_chain': 'lidar', 'codec_profile': 'Flat',
-            'hp_driver_gain': 0, 'lo_driver_gain': 0,
+            'hp_driver_gain': 6, 'lo_driver_gain': 6,
             'pre_gain_db': 0, 'bass_makeup_db': 0,
             'playback_card': 0, 'playback_device': 0,
             'playback_rate': 48000, 'playback_channels': 2,

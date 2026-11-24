@@ -2802,11 +2802,23 @@ static void render_period(struct source_bus *sources,
  * at "uncomfortable in the same room", and on-device microphone captures
  * showed limiter and speaker distortion from about logical 65 of the 0 dB
  * curve upward, so full-scale pre-DSP gain is no longer reachable.  Logical
- * zero remains mute in the callers. */
+ * zero remains mute in the callers.
+ *
+ * Lidar has no software DSP behind the master, so the MT8163 cap is pure
+ * loss there: its curve keeps the -60 dB floor and the same shape but tops
+ * out at -3 dB (raw 121), leaving headroom because nothing limits the PCM
+ * before the DAC.  With LO Driver Gain at 0 dB that sits 3 dB under the
+ * stock speaker maximum. */
+#define LOGICAL_MASTER_FLOOR_RAW 7
+#define LOGICAL_MASTER_TOP_RAW 103
+#define LIDAR_MASTER_TOP_RAW 121
 static int logical_master_raw(int percent)
 {
+	int top = speaker_profile.lidar_chain ? LIDAR_MASTER_TOP_RAW
+					      : LOGICAL_MASTER_TOP_RAW;
 	double x = (double)(percent - 1) / 99.0;
-	return 103 - (int)floor(96.0 * pow(1.0 - x, 1.3) + 0.5);
+	return top - (int)floor((double)(top - LOGICAL_MASTER_FLOOR_RAW) *
+				pow(1.0 - x, 1.3) + 0.5);
 }
 
 /* All sources share the hardware master.  Index the equaliser using the

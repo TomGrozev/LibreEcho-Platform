@@ -258,6 +258,15 @@ int main(void)
     assert(10 * (logical_master_raw(51) - logical_master_raw(1)) >=
            14 * (logical_master_raw(100) - logical_master_raw(51)));
     assert(logical_master_raw(100) - logical_master_raw(94) >= 2);
+    /* Lidar has no limiter behind the master: same -60 dB floor, -3 dB
+     * ceiling.  The MT8163 curve above must not move with it. */
+    speaker_profile.lidar_chain = 1;
+    assert(logical_master_raw(1) == 7);           /* -60 dB */
+    assert(logical_master_raw(100) == 121);       /* -3 dB ceiling */
+    for (i = 2; i <= 100; ++i)
+        assert(logical_master_raw(i) >= logical_master_raw(i - 1));
+    speaker_profile.lidar_chain = 0;
+    assert(logical_master_raw(100) == 103);
     /* Logical 51: raw 65 (-31 dB), effective percent 51, preset 60. */
     {
         float gains[SPEAKER_DSP_LOUDNESS_SECTIONS];
