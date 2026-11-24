@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'initramfs/libreecho-generation-transaction'
-BUSYBOX = shutil.which('busybox') or BUSYBOX
+BUSYBOX = shutil.which('busybox') or 'busybox'
 
 class ServiceIdentity(unittest.TestCase):
     def probe(self, engine=True, corrupt=False, controller_bad=False, wrong_path=False, feature='airplay2'):
