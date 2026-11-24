@@ -96,7 +96,9 @@ class FakeMtk:
             "boot1": bytearray(deterministic("boot1", backup.BOOT_AREA_BYTES,
                                              b"EMMC_BOOT")),
             "expdb": bytearray(backup.BY_NAME["expdb"].size),
-            "tee1": bytearray(deterministic("tee1", backup.BY_NAME["tee1"].size)),
+            "tee1": bytearray(
+                prepare.MTK_IMAGE_MAGIC + b"\0\0\0\0atf\0"
+                + deterministic("tee1", backup.BY_NAME["tee1"].size)[12:]),
             "misc": bytearray(backup.BY_NAME["misc"].size),
             "persist": bytearray(backup.BY_NAME["persist"].size),
             "lk_a": bytearray(deterministic("lk_a", backup.BY_NAME["lk_a"].size)),
@@ -451,6 +453,13 @@ class InstallTests(CommandCase):
         self.assertFalse(any(write[1] == "boot1" for write in self.fake.writes))
         events = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertTrue(any(event.get("generation") == "kaeru-v2" for event in events))
+        donor_dir = directory.parent / "donor-artifacts"
+        donor_manifest = json.loads((donor_dir / "donor-artifacts.json").read_text())
+        self.assertTrue(all(record["donor_derived"]
+                            for record in donor_manifest["artifacts"]))
+        staged = (donor_dir / "tee1-stage.bin").read_bytes()
+        self.assertEqual(bytes(self.fake.areas["tee1"]), staged)
+        self.assertTrue(staged.startswith(Path(self.inputs["koboreru"]).read_bytes()))
 
     def test_missing_backup_refuses(self):
         _drill, stock = self.reports()

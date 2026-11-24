@@ -50,6 +50,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 
 import lidar_backup_set as backup  # noqa: E402
+import lidar_donor_artifacts as donor  # noqa: E402
 import libreecho_platform_targets as targets  # noqa: E402
 from expdb_guard import (  # noqa: E402
     MTK_IMAGE_MAGIC,
@@ -84,12 +85,10 @@ NEVER_WRITE = frozenset({"boot1"})
 EXPDB = "expdb"
 KAERU_STAGE_BYTES = 0x40000
 STOCK_BOOT_TOKEN = "stock-boot-ok"
-# The 2019 signed preloader area 1 the Koboreru offsets were derived from
-# (lab-notes/phase-03/notes.md in libreecho-lidar-port).  A different
-# preloader has no reviewed patch sites, so it needs an explicit override.
-REVIEWED_PRELOADER_SHA256 = (
-    "fb987ad9cd2af5e4d86e6476f1f154e555795d915d247a23110b80ed0363de45")
-PRELOADER_MAGIC = b"EMMC_BOOT"
+# The reviewed signed preloader pin and magic live in the donor generator now;
+# the install stage hands the pin to it and consumes the generated files.
+REVIEWED_PRELOADER_SHA256 = donor.REVIEWED_PRELOADER_SHA256
+PRELOADER_MAGIC = donor.PRELOADER_MAGIC
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -503,59 +502,12 @@ def _check_input(path: Path, expected_sha256: str, label: str, *,
     return data
 
 
-def build_chain(koboreru: bytes, stock_tee1: bytes) -> bytes:
-    """Compose the tee1 stage: Koboreru prefix, then the stock tee1 tail."""
-    if len(koboreru) > len(stock_tee1):
-        raise Refusal("Koboreru image is larger than the tee1 partition")
-    return koboreru + stock_tee1[len(koboreru):]
-
-
-def load_reviewed_preloader(backup_dir: Path, files: dict[str, dict]) -> bytes:
-    """Load the signed preloader from the verified backup's boot0 file."""
-    path = backup_dir / files["boot0"]["file"]
-    try:
-        data = path.read_bytes()
-    except OSError as error:
-        raise Refusal(f"cannot read the backup boot0 preloader: {error}") from error
-    if len(data) != backup.BOOT_AREA_BYTES:
-        raise Refusal(
-            f"backup boot0 is {len(data)} bytes, expected {backup.BOOT_AREA_BYTES}")
-    if not data.startswith(PRELOADER_MAGIC):
-        raise Refusal("backup boot0 does not start with the preloader magic")
-    digest = sha256_bytes(data)
-    if digest != REVIEWED_PRELOADER_SHA256:
-        raise Refusal(
-            f"backup boot0 is {digest}, not the reviewed 2019 signed preloader "
-            f"{REVIEWED_PRELOADER_SHA256}; its layout is the only one the Koboreru "
-            "patch sites were derived from (lab-notes/phase-03/notes.md).  A "
-            "needs an owner decision, not a flag")
-    return data
-
-
 def stage_install(adapter, log: JsonlLog, backup_dir: Path, manifest_path: Path,
                   drill_report: Path, stock_report: Path, *,
                   kaeru_path: Path, kaeru_sha256: str,
-                  koboreru_path: Path, koboreru_sha256: str) -> None:
+                  koboreru_path: Path, koboreru_sha256: str,
+                  donor_dir: Path) -> None:
     dry = adapter.dry_run
-    preloader_from_backup = True
-    if dry and not manifest_path.is_file():
-        print(f"DRY-RUN install: {manifest_path} is produced by the backup stage")
-        files = {"tee1": {"file": "tee1.bin"}, "boot0": {"file": "boot0.bin"}}
-        stock_tee1 = b"\0" * backup.BY_NAME["tee1"].size
-        preloader = b"\0" * backup.BOOT_AREA_BYTES
-        preloader_from_backup = False
-    else:
-        files = _load_verified_backup(backup_dir, manifest_path)
-        stock_tee1 = (backup_dir / files["tee1"]["file"]).read_bytes()
-        preloader = load_reviewed_preloader(backup_dir, files)
-    drill = _check_report(drill_report, SCHEMA_DRILL, dry_run=dry, what="install drill gate")
-    _check_report(stock_report, SCHEMA_STOCK_BOOT, dry_run=dry, what="install stock-boot gate")
-    if drill and not dry and drill.get("manifest_sha256") != sha256_file(manifest_path):
-        raise Refusal("the drill report was produced from a different backup manifest")
-
-    if not preloader_from_backup:
-        print("DRY-RUN install: take the signed preloader from the verified "
-              "backup's boot0 and require the reviewed digest")
     kaeru = _check_input(kaeru_path, kaeru_sha256, "kaeru", maximum=KAERU_STAGE_BYTES)
     if len(kaeru) < 16 or kaeru[:4] != MTK_IMAGE_MAGIC or kaeru[8:11] != b"LK\0":
         raise Refusal("Kaeru input is not an MTK LK image")
@@ -564,8 +516,35 @@ def stage_install(adapter, log: JsonlLog, backup_dir: Path, manifest_path: Path,
     if len(koboreru) < 16 or koboreru[:4] != MTK_IMAGE_MAGIC or koboreru[8:11] != b"atf":
         raise Refusal("Koboreru input is not an MTK ATF/TEE image")
 
+    _recheck_identity(adapter, log, "install")
+
+    if dry:
+        if not manifest_path.is_file():
+            print(f"DRY-RUN install: {manifest_path} is produced by the backup stage")
+        else:
+            _load_verified_backup(backup_dir, manifest_path)
+        print(f"DRY-RUN install: donor artifacts would be generated under {donor_dir}")
+        tee1_stage = b"\0" * backup.BY_NAME["tee1"].size
+        preloader = b"\0" * backup.BOOT_AREA_BYTES
+    else:
+        _load_verified_backup(backup_dir, manifest_path)
+        try:
+            donor_manifest = donor.generate(
+                backup_dir, manifest_path, donor_dir,
+                koboreru=koboreru, koboreru_sha256=koboreru_sha256,
+                preloader_sha256=REVIEWED_PRELOADER_SHA256)
+            tee1_stage = donor.load_artifact(
+                donor_dir, donor_manifest, "tee1-stage.bin")
+            preloader = donor.load_artifact(
+                donor_dir, donor_manifest, "boot0-preloader.bin")
+        except donor.Refusal as error:
+            raise Refusal(str(error)) from error
+    drill = _check_report(drill_report, SCHEMA_DRILL, dry_run=dry, what="install drill gate")
+    _check_report(stock_report, SCHEMA_STOCK_BOOT, dry_run=dry, what="install stock-boot gate")
+    if drill and not dry and drill.get("manifest_sha256") != sha256_file(manifest_path):
+        raise Refusal("the drill report was produced from a different backup manifest")
+
     expdb_stage = kaeru + b"\0" * (KAERU_STAGE_BYTES - len(kaeru))
-    tee1_stage = build_chain(koboreru, stock_tee1)
     preloader_body = preloader[backup.SECTOR_BYTES:]
     preloader_sector0 = preloader[:backup.SECTOR_BYTES]
 
@@ -686,7 +665,8 @@ def stage_run(adapter, log: JsonlLog, session: Path, *, args,
     stage_install(
         adapter, log, backup_dir, manifest_path, drill_report, stock_report,
         kaeru_path=Path(args.kaeru), kaeru_sha256=args.kaeru_sha256,
-        koboreru_path=Path(args.koboreru), koboreru_sha256=args.koboreru_sha256)
+        koboreru_path=Path(args.koboreru), koboreru_sha256=args.koboreru_sha256,
+        donor_dir=session / "donor-artifacts")
     stage_confirm(args.fastboot, log, dry_run=adapter.dry_run, runner=fastboot_runner)
 
 
@@ -736,6 +716,9 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--drill-report", required=True, type=Path)
     install.add_argument("--stock-boot-report", required=True, type=Path)
     add_chain_inputs(install)
+    install.add_argument("--donor-dir", type=Path,
+                         help="generated donor artifact directory "
+                              "(default: <backup-dir>/../donor-artifacts)")
     install.add_argument("--yes", action="store_true", help="confirm the chain writes")
 
     sub.add_parser("confirm", help="require Kaeru fastboot to report product LIDAR")
@@ -807,7 +790,9 @@ def main(argv: list[str] | None = None, *, adapter_factory=None,
                     args.drill_report, args.stock_boot_report,
                     kaeru_path=args.kaeru, kaeru_sha256=args.kaeru_sha256,
                     koboreru_path=args.koboreru,
-                    koboreru_sha256=args.koboreru_sha256)
+                    koboreru_sha256=args.koboreru_sha256,
+                    donor_dir=args.donor_dir or (
+                        args.backup_dir.parent / "donor-artifacts"))
             elif args.command == "run":
                 if not args.yes and not args.dry_run:
                     raise Refusal("the run writes flash; pass --yes after approval")

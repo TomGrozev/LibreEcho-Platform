@@ -72,6 +72,42 @@ Each stage requires its own approval: `drill` and `install` refuse without
 `--yes`, and `run` also needs `--stock-boot-ok` or an interactive
 `stock-boot-ok` token.
 
+## Donor-derived artifacts
+
+The stock preloader and the stock `tee1` tail come from the owner's backup, so
+they are generated only under a private checkout directory (or outside a
+checkout) and never shipped:
+
+```sh
+python3 lidar_donor_artifacts.py \
+    --backup-dir /mnt/backup/lidar-backup-20261124 \
+    --out /mnt/backup/lidar-chain \
+    --koboreru tee-payload-lidar.img --koboreru-sha256 <hex>
+```
+
+It first runs `lidar_backup_set.require_complete_backup`, then writes
+`boot0-preloader.bin`, `tee1-stock.bin`, and, with Koboreru, the stock tail and
+composed `tee1-stage.bin`, plus `donor-artifacts.json` with every digest.  The
+`install` stage calls the same generator and consumes `tee1-stage.bin` and
+`boot0-preloader.bin`; it no longer slices the backup itself.  Any output path
+inside a git checkout must sit under a `private`, `local` or `local-firmware`
+directory.
+
+The stock Zigbee GBLs are captured from a host dump, never a device:
+
+```sh
+python3 capture_stock_gbls.py --source /mnt/dump/stock/system_a_rootfs \
+    --out ../../../local-firmware
+```
+
+It verifies each known size and sha256 and writes a `local-firmware/.gitignore`
+that keeps the files out of git.
+
+The product release gate (`LibreEcho` `tools/prepare-release.py`,
+`reject_donor_derived_artifacts`) refuses an asset with an MTK preloader/LK/TEE
+or eMMC boot header, a Gecko GBL header, an EFR32 radio name, or a digest from
+`donor-artifacts.json`.
+
 ## Chain layout
 
 Grounded in `lab-notes/phase-03/notes.md` (libreecho-lidar-port repository),
@@ -104,10 +140,14 @@ mtkclient does, which covers the adapter's partition-relative read logic.
 
 | Path | Purpose |
 | --- | --- |
-| `lidar_prepare.py` | stages, GPT/geometry checks, chain composition, CLI |
+| `lidar_prepare.py` | stages, GPT/geometry checks, chain install, CLI |
+| `lidar_donor_artifacts.py` | donor-derived chain artifacts and digest manifest |
+| `capture_stock_gbls.py` | verified copy of the stock Zigbee GBLs into `local-firmware/` |
 | `mtk_adapter.py` | the one mtkclient seam: identity, area reads, pocket writes |
 | `host_io.py` | shared hashing, timestamp and atomic-write helpers |
 | `test_lidar_prepare.py` | host tests with a fake adapter and runner |
+| `test_lidar_donor_artifacts.py` | synthetic backup and composition tests |
+| `test_capture_stock_gbls.py` | synthetic rootfs capture tests |
 
 Shared modules are imported from `../install/lidar_backup_set.py`,
 `../install/expdb_guard.py`, and `../libreecho_platform_targets.py`; no data or
