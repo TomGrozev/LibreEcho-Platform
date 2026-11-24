@@ -52,6 +52,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
 import libreecho_platform_targets as targets  # noqa: E402
 from expdb_guard import EXPDB_PREFIX_BYTES, ExpdbGenerationError, check_expdb_prefix  # noqa: E402
 
@@ -398,6 +401,30 @@ def require_writable_partition(partition: str, *, bcb: bool = False) -> None:
                       f'({", ".join(sorted(WRITABLE_PARTITIONS))})')
     if partition == 'misc' and not bcb:
         raise Refusal('misc is only writable through the bcb commands')
+
+
+def require_kaeru_expdb_chain(fb: Fastboot, log: RunLog) -> str:
+    """Establish the expdb chain generation before a flash write.
+
+    Platform AGENTS.md:84-88 (``Boot-chain safety`` rule 2): read
+    ``expdb[0:16]``; the MTK image magic means the v2.0.0 Kaeru payload is in
+    place, an ASCII ``FASTBOOT_PLEASE`` means the chain is already broken.
+    A short or failed read refuses exactly like a mismatch: the write path has
+    no safe fallback.  ``fetch_range`` asks Kaeru for one bounded range, so a
+    10 MiB expdb is never streamed.
+    """
+    try:
+        prefix = fb.fetch_range('expdb', 0, EXPDB_PREFIX_BYTES)
+        generation = check_expdb_prefix(prefix)
+    except ExpdbGenerationError as error:
+        raise Refusal(str(error)) from error
+    except InstallError as error:
+        raise Refusal(
+            f'cannot read expdb[0:{EXPDB_PREFIX_BYTES}] for the chain-generation '
+            f'check: {error}') from error
+    log.note(f'expdb[0:{EXPDB_PREFIX_BYTES}]: {generation} '
+             f'({prefix[:4].hex()}); chain generation ok')
+    return generation
 
 
 def check_device(fb: Fastboot, log: RunLog, *, full: bool) -> dict[str, int]:
@@ -1111,6 +1138,10 @@ def install(boot: Path, boot_b: Path | None, userdata: Path | None, assume_yes: 
     if not assume_yes:
         raise Refusal('refusing to write without --yes')
 
+    # Every write below follows this check (AGENTS.md:84-88); there is no
+    # earlier flash in ``install`` that could run without it.
+    require_kaeru_expdb_chain(fb, log)
+
     writes = [('boot_a', boot), ('boot_b', second)]
     if userdata is not None:
         writes.append(('userdata', userdata))
@@ -1194,6 +1225,8 @@ def bcb_show(fb: Fastboot, log: RunLog) -> None:
 
 def bcb_write(fb: Fastboot, log: RunLog, target: int | None) -> None:
     check_device(fb, log, full=False)
+    # The BCB update flashes misc; establish the chain generation first.
+    require_kaeru_expdb_chain(fb, log)
     workspace = Path(tempfile.mkdtemp(prefix='lidar-bcb-'))
     try:
         original, _path = fetch_misc(fb, log, workspace)

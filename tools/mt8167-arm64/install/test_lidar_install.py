@@ -22,6 +22,13 @@ TOOL = HERE / 'lidar_install.py'
 FAKE = HERE / 'fake_fastboot.py'
 sys.path.insert(0, str(HERE))
 import lidar_install as li  # noqa: E402
+import expdb_guard  # noqa: E402
+
+# The reviewed v2.0.0 expdb prefix: an MTK LK image header (magic, LE32 data
+# size, "LK"), as in the lab's phase-03 expdb sources.  The size differs between
+# builds, so only the magic is compared.
+EXPDB_V2_PREFIX = bytes.fromhex('88168858d0400300') + b'LK\0\0\0\0\0\0'
+EXPDB_BROKEN_PREFIX = b'FASTBOOT_PLEASE\0'
 
 
 def expand_sparse_over(image: Path, target: Path, junk: int = 0xA5) -> None:
@@ -70,6 +77,7 @@ class InstallerCase(unittest.TestCase):
         self.parts = self.state / 'parts'
         self.parts.mkdir()
         self.logdir = self.tmp / 'logs'
+        self.expdb_prefix = EXPDB_V2_PREFIX
         (self.state / 'sizes.json').write_text(json.dumps(li.PARTITION_BYTES))
         os.chmod(FAKE, 0o755)
         for name in ('boot_a', 'boot_b'):
@@ -89,7 +97,8 @@ class InstallerCase(unittest.TestCase):
              '--log-dir', str(self.logdir), *args],
             capture_output=True, text=True, env=environment, timeout=timeout)
 
-    def run_main(self, *args: str, fetch_range=None) -> tuple[int, str, str]:
+    def run_main(self, *args: str, fetch_range=None,
+                 env: dict[str, str] | None = None) -> tuple[int, str, str]:
         """Run the CLI in this process, with a fake ``fetch_range`` if given.
 
         The stock client is replaced by ``fake_fastboot.py``, which cannot
@@ -98,6 +107,7 @@ class InstallerCase(unittest.TestCase):
         """
         environment = dict(os.environ)
         environment['FAKE_FASTBOOT_STATE'] = str(self.state)
+        environment.update(env or {})
         out, err = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(unittest.mock.patch.dict(os.environ, environment))
@@ -113,6 +123,8 @@ class InstallerCase(unittest.TestCase):
     def fetch_range_from_parts(self, partition: str, offset: int,
                                length: int) -> bytes:
         """Serve ``fetch_range`` from the fake client's flashed partition."""
+        if partition == 'expdb':
+            return self.expdb_prefix[offset:offset + length]
         data = (self.parts / f'{partition}.img').read_bytes()
         return data[offset:offset + length]
 
@@ -184,6 +196,30 @@ class AllowListTests(unittest.TestCase):
         li.require_writable_partition('userdata')
 
 
+class ExpdbGuardTests(unittest.TestCase):
+    def test_v2_kaeru_header_is_accepted(self) -> None:
+        self.assertEqual(expdb_guard.check_expdb_prefix(EXPDB_V2_PREFIX), 'kaeru-v2')
+
+    def test_fastboot_please_marker_is_refused(self) -> None:
+        with self.assertRaisesRegex(expdb_guard.ExpdbGenerationError,
+                                    'FASTBOOT_PLEASE'):
+            expdb_guard.check_expdb_prefix(EXPDB_BROKEN_PREFIX)
+
+    def test_blank_or_foreign_payload_is_refused(self) -> None:
+        for prefix in (b'\0' * 16, b'ANDROID!' + b'\0' * 8):
+            with self.subTest(prefix=prefix), \
+                    self.assertRaisesRegex(expdb_guard.ExpdbGenerationError,
+                                           'expected MTK magic'):
+                expdb_guard.check_expdb_prefix(prefix)
+
+    def test_short_or_missing_read_is_refused(self) -> None:
+        for prefix in (None, b'', EXPDB_V2_PREFIX[:15]):
+            with self.subTest(prefix=prefix), \
+                    self.assertRaisesRegex(expdb_guard.ExpdbGenerationError,
+                                           'unreadable'):
+                expdb_guard.check_expdb_prefix(prefix)
+
+
 class InstallTests(InstallerCase):
     def test_refuses_non_16mib_before_any_write(self) -> None:
         image = self.boot_image(size=8 * 1024 * 1024)
@@ -206,11 +242,43 @@ class InstallTests(InstallerCase):
         self.assertIn('--yes', result.stderr)
         self.assertEqual(self.batch(), [])
 
+    def test_refuses_broken_expdb_before_any_write(self) -> None:
+        self.expdb_prefix = EXPDB_BROKEN_PREFIX
+        image = self.boot_image()
+        code, out, err = self.run_main('install', '--boot', str(image), '--yes',
+                                       fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 2, err)
+        self.assertIn('FASTBOOT_PLEASE', err)
+        self.assertEqual(self.batch(), [])
+        self.assertNotIn('flashed and verified', out)
+
+    def test_refuses_unreadable_expdb_before_any_write(self) -> None:
+        image = self.boot_image()
+
+        def unreadable(_self, _partition: str, _offset: int, _length: int) -> bytes:
+            raise li.InstallError('usb fetch expdb failed')
+
+        code, _out, err = self.run_main('install', '--boot', str(image), '--yes',
+                                        fetch_range=unreadable)
+        self.assertEqual(code, 2, err)
+        self.assertIn('cannot read expdb', err)
+        self.assertEqual(self.batch(), [])
+
+    def test_refuses_short_expdb_before_any_write(self) -> None:
+        self.expdb_prefix = EXPDB_V2_PREFIX[:8]
+        image = self.boot_image()
+        code, _out, err = self.run_main('install', '--boot', str(image), '--yes',
+                                        fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 2, err)
+        self.assertIn('unreadable', err)
+        self.assertEqual(self.batch(), [])
+
     def test_flashes_both_slots_and_verifies(self) -> None:
         image = self.boot_image()
-        result = self.run_cli('install', '--boot', str(image), '--yes')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('install: flashed and verified', result.stdout)
+        code, out, err = self.run_main('install', '--boot', str(image), '--yes',
+                                       fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 0, err)
+        self.assertIn('install: flashed and verified', out)
         expected = image.read_bytes()
         for name in ('boot_a', 'boot_b'):
             self.assertEqual((self.parts / f'{name}.img').read_bytes(), expected)
@@ -228,9 +296,10 @@ class InstallTests(InstallerCase):
         second_data = bytearray(second.read_bytes())
         second_data[100] ^= 0xFF
         second.write_bytes(second_data)
-        result = self.run_cli('install', '--boot', str(first),
-                              '--boot-b', str(second), '--yes')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        code, _out, err = self.run_main('install', '--boot', str(first),
+                                        '--boot-b', str(second), '--yes',
+                                        fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 0, err)
         self.assertEqual((self.parts / 'boot_a.img').read_bytes(), first.read_bytes())
         self.assertEqual((self.parts / 'boot_b.img').read_bytes(), second.read_bytes())
 
@@ -283,10 +352,13 @@ class InstallTests(InstallerCase):
 
     def test_readback_mismatch_aborts(self) -> None:
         image = self.boot_image()
-        result = self.run_cli('install', '--boot', str(image), '--yes',
-                              env={'FAKE_CORRUPT_FETCH_PART': 'boot_a'})
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('readback sha256', result.stderr)
+        code, out, err = self.run_main(
+            'install', '--boot', str(image), '--yes',
+            fetch_range=self.fetch_range_from_parts,
+            env={'FAKE_CORRUPT_FETCH_PART': 'boot_a'})
+        self.assertEqual(code, 1)
+        self.assertIn('readback sha256', err)
+        self.assertNotIn('install: flashed and verified', out)
 
     def test_bad_boot_a_readback_stops_before_next_flash(self) -> None:
         image = self.boot_image()
@@ -324,8 +396,9 @@ class BcbTests(InstallerCase):
 
     def test_set_active_changes_only_bcb_bytes(self) -> None:
         before = self.make_misc(li.FRESH_BCB)
-        result = self.run_cli('bcb', 'set-active', 'B')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        code, out, err = self.run_main('bcb', 'set-active', 'B',
+                                       fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 0, err)
         after = self.misc_bytes()
         changed = {index for index in range(len(after)) if after[index] != before[index]}
         self.assertTrue(all(li.BCB_OFFSET <= index < li.BCB_OFFSET + li.BCB_SIZE
@@ -336,25 +409,37 @@ class BcbTests(InstallerCase):
         backups = list(self.logdir.glob('misc-*-before.bin'))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), before)
-        self.assertIn('selected_slot=b', result.stdout)
+        self.assertIn('selected_slot=b', out)
 
     def test_reset_writes_fresh_record(self) -> None:
         self.make_misc(bytes((0x00, 0x41, 0x42, 0x42, 0x01, 0x8E, 0x3F)))
         before = self.misc_bytes()
-        result = self.run_cli('bcb', 'reset')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        code, out, err = self.run_main('bcb', 'reset',
+                                       fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 0, err)
         after = self.misc_bytes()
         changed = {index for index in range(len(after)) if after[index] != before[index]}
         self.assertTrue(all(li.BCB_OFFSET <= index < li.BCB_OFFSET + li.BCB_SIZE
                             for index in changed))
         self.assertEqual(after[li.BCB_OFFSET:li.BCB_OFFSET + li.BCB_SIZE], li.FRESH_BCB)
-        self.assertIn('selected_slot=a', result.stdout)
+        self.assertIn('selected_slot=a', out)
 
     def test_set_active_refuses_unconfirmed_current(self) -> None:
         self.make_misc(b'\x00ABB\x01\x00\x00')
-        result = self.run_cli('bcb', 'set-active', 'B')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('no bootable slot', result.stderr)
+        code, out, err = self.run_main('bcb', 'set-active', 'B',
+                                       fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 1)
+        self.assertIn('no bootable slot', err)
+
+    def test_write_refuses_mismatched_expdb_before_flashing_misc(self) -> None:
+        before = self.make_misc(li.FRESH_BCB)
+        self.expdb_prefix = EXPDB_BROKEN_PREFIX
+        code, _out, err = self.run_main('bcb', 'reset',
+                                        fetch_range=self.fetch_range_from_parts)
+        self.assertEqual(code, 2, err)
+        self.assertIn('FASTBOOT_PLEASE', err)
+        self.assertEqual(self.misc_bytes(), before)
+        self.assertFalse(any(line.startswith('flash misc') for line in self.batch()))
 
 
 class MakeUserdataTests(InstallerCase):
