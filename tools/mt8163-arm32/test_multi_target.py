@@ -537,7 +537,7 @@ class RadarTreeDiffTests(unittest.TestCase):
     # Re-reviewed again for 0.14.6 (Platform #322): Home Assistant voice mode
     # keeps ttsd, so reminders and the announce action can speak. Its staged
     # bytes are pinned to that reviewed commit.
-    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '7661bc23f'}
+    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '50b2347b2'}
 
     @staticmethod
     def tree(stage):
