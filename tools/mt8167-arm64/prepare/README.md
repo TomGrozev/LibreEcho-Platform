@@ -1,0 +1,114 @@
+# Lidar preparation command
+
+`lidar_prepare.py` is the reviewed replacement for the hand-run BROM session
+described in `lab-notes/phase-07/prep-command.md` (libreecho-lidar-port
+repository).  It takes the boot-chain backup, runs the same-byte restore drill
+and stock-boot gate, installs the owner-access chain, and confirms Kaeru
+fastboot.  It writes only boot-chain areas and never writes BOOT1 or expires
+the `expdb` rule.
+
+## Stages
+
+| Command | Device access | Writes |
+| --- | --- | --- |
+| `identify` | `printgpt`, GPT and backup GPT reads | none |
+| `backup` | reads every `lidar_backup_set.py` area twice | host files only |
+| `drill` | reads, then writes identical bytes to the drill areas | gpt, gpt_backup, expdb, tee1, boot0 body, boot0 sector 0 last |
+| `stock-boot` | none | none; records the operator's confirmation |
+| `install` | reads, writes expdb, tee1, boot0 area 1 | expdb, tee1, boot0 area 1 (sector 0 last) |
+| `confirm` | `fastboot getvar product` | none |
+| `run` | all of the above in order | as above |
+
+Every stage refuses to continue on a failed check.  Exit code 2 is a refusal
+(the run stops at that check), 1 is a failed check or command, 0 is success.
+A re-run after a partial install skips the expdb write only when expdb already
+holds the byte-identical expected Kaeru stage and then continues with tee1 and
+BOOT0; any other installed expdb content is refused.
+
+## Usage
+
+```sh
+python3 lidar_prepare.py --mtkclient /opt/mtkclient \
+    --workdir /tmp/lidar-prepare-work identify
+
+python3 lidar_prepare.py --workdir /tmp/lidar-prepare-work \
+    backup --backup-dir /tmp/lidar-backup-20261124
+
+python3 lidar_prepare.py --workdir /tmp/lidar-prepare-work \
+    drill --backup-dir /tmp/lidar-backup-20261124 --yes
+
+# Power-cycle to a normal stock boot, then:
+python3 lidar_prepare.py stock-boot --report /tmp/lidar-stock-boot.json
+
+# Back in BROM with a fresh work directory:
+python3 lidar_prepare.py --workdir /tmp/lidar-install-work \
+    install --backup-dir /tmp/lidar-backup-20261124 \
+    --drill-report /tmp/lidar-backup-20261124/drill-report.json \
+    --stock-boot-report /tmp/lidar-stock-boot.json \
+    --kaeru lidar-kaeru.bin --kaeru-sha256 <hex> \
+    --koboreru tee-payload-lidar.img --koboreru-sha256 <hex> --yes
+
+python3 lidar_prepare.py confirm --fastboot fastboot
+```
+
+`--mtkclient` names the mtkclient checkout; `MTKCLIENT` in the environment
+serves the same purpose, and there is no built-in default.
+
+`run` chains them with one session directory and `--yes`:
+
+```sh
+python3 lidar_prepare.py --mtkclient /opt/mtkclient --workdir /tmp/lidar-empty run \
+    --session-dir /tmp/lidar-prep-20261124 \
+    --kaeru ... --kaeru-sha256 ... \
+    --koboreru ... --koboreru-sha256 ... --yes --stock-boot-ok
+```
+
+Add `--dry-run` to print every mtkclient and fastboot command instead of
+running it; it writes no host files.  Dry-run still validates the local input
+files and their pinned digests; it prints, rather than checks, the
+device-dependent gates.
+
+Each stage requires its own approval: `drill` and `install` refuse without
+`--yes`, and `run` also needs `--stock-boot-ok` or an interactive
+`stock-boot-ok` token.
+
+## Chain layout
+
+Grounded in `lab-notes/phase-03/notes.md` (libreecho-lidar-port repository),
+including its "Session 2: chain install" record:
+
+1. `expdb` gets the source-built Kaeru LK stage padded with zeros to 0x40000.
+2. A fresh `expdb[0:16]` read must pass `install/expdb_guard.py:check_expdb_prefix`.
+3. `tee1` gets the source-built Koboreru image followed by the stock `tee1`
+   tail from the verified backup.
+4. BOOT0 area 1 gets the signed preloader from the verified backup's `boot0`
+   file; bytes 512..end first, sector 0 last.
+5. BOOT1 (area 2) is read before and after and must be unchanged.
+
+The backup's preloader must hash to the reviewed 2019 signed image
+(`fb987ad9...`), the only layout the Koboreru patch sites were derived from
+(`lab-notes/phase-03/notes.md`).  Any other preloader is refused: taking a
+different one is an owner decision, not a command-line flag.
+
+## Tests
+
+```sh
+python3 -m unittest -v test_lidar_prepare
+```
+
+The suite uses an in-memory fake adapter and a fake subprocess runner, so it
+never opens USB or runs mtkclient.  The runner stand-in writes files the way
+mtkclient does, which covers the adapter's partition-relative read logic.
+
+## Files
+
+| Path | Purpose |
+| --- | --- |
+| `lidar_prepare.py` | stages, GPT/geometry checks, chain composition, CLI |
+| `mtk_adapter.py` | the one mtkclient seam: identity, area reads, pocket writes |
+| `host_io.py` | shared hashing, timestamp and atomic-write helpers |
+| `test_lidar_prepare.py` | host tests with a fake adapter and runner |
+
+Shared modules are imported from `../install/lidar_backup_set.py`,
+`../install/expdb_guard.py`, and `../libreecho_platform_targets.py`; no data or
+verifier is duplicated here.
