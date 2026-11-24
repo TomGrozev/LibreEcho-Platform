@@ -1165,22 +1165,30 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             (
                 "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-5}",
                 "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
+                "ESPHOMED_PIDFILE=${LIBREECHO_ESPHOMED_PIDFILE:-/var/run/libreecho-esphomed.pid}",
+                "ESPHOME_STATUS_FILE=${LIBREECHO_ESPHOME_STATUS_FILE:-/run/libreecho/esphome-status.json}",
+                "ESPHOMED_DAEMON=${LIBREECHO_ESPHOMED_DAEMON:-/usr/local/sbin/libreecho-esphomed}",
+                "ESPHOME_PORT=${LIBREECHO_ESPHOME_PORT:-6053}",
+                "integration_state()",
                 "bluetooth_integration_state()",
                 "bluetooth_ready()",
-                "airplay_integration_state()",
-                "voice_services()",
-                "voice_sockets()",
-                "assistant_services()",
+                "feature_policy()",
                 "service_alive()",
                 "startup_services_ready()",
+                "esphome_service_ready()",
                 "for socket in network audio mic led; do",
-                "case \"$(airplay_integration_state)\" in",
-                "pidfile=/var/run/libreecho-airplayd.pid",
-                "[ -S /run/libreecho/airplay.sock ] || return 1",
+                "case \"$(integration_state 16)\" in",
+                "service_alive airplayd || return 1",
+                "if [ \"$(feature_policy)\" = community-noncommercial ]; then",
+                "service_alive waked || return 1",
                 "case \"$(bluetooth_integration_state)\" in",
                 "disabled) ;;",
                 "enabled)",
-                '[ -f "$BT_READY_PATH" ]',
+                'bluetooth_ready || return 1',
+                "for service in sttd ttsd agentd; do",
+                "for socket in stt tts agent; do",
+                "if [ \"$(integration_state 1)\" = enabled ]; then",
+                '"$ESPHOMED_DAEMON" --health-check "$ESPHOMED_PIDFILE" "$ESPHOME_STATUS_FILE"',
                 "mark_startup_ready()",
                 "delay=1",
                 "while :; do",
@@ -1191,16 +1199,7 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 'sleep "$delay"',
                 "delay=$((delay * 2))",
                 '[ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY',
-                "assistant_running=0",
-                "for service in $(assistant_services); do",
-                "for service in $(voice_services); do",
-                "for socket in $(voice_sockets); do",
-                'if [ "$assistant_running" -eq 1 ]; then',
-                "esphome_integration_state()",
-                "esphome_service_ready()",
-                "disabled) return 0 ;;",
-                '[ -S "/run/libreecho/$socket.sock" ] || return 1',
-                "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
+                "mark_startup_ready >/dev/null 2>&1 &",
             ),
         ),
         (
@@ -1301,6 +1300,21 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                     raise SystemExit(
                         f"ERROR: UI startup Bluetooth contract missing {marker!r}"
                     )
+            ordered_startup = (
+                'case "$(integration_state 16)" in',
+                "service_alive airplayd || return 1",
+                'if [ "$(feature_policy)" = community-noncommercial ]; then',
+                "service_alive waked || return 1",
+                'case "$(bluetooth_integration_state)" in',
+                'if [ "$(integration_state 1)" = enabled ]; then',
+                "esphome_service_ready",
+                "for service in sttd ttsd agentd; do",
+            )
+            startup_positions = [startup_body.index(marker) for marker in ordered_startup]
+            if startup_positions != sorted(startup_positions):
+                raise SystemExit(
+                    "ERROR: UI startup optional-integration ordering is invalid"
+                )
             dispatch_start = text.index('case "${1:-}" in')
             readiness_body = text[readiness_start:dispatch_start]
             ordered = (

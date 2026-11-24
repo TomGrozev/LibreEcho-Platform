@@ -655,8 +655,8 @@ class RadarTreeDiffTests(unittest.TestCase):
             # reviewed v3 startup contract is pinned to its exact source.
             # The saved-SSH-switch change (activation contract and persistent
             # host key) edits add_ssh_bundle; pin its reviewed source too. The
-            # startup contract was re-reviewed for the voice and ESPHome gates.
-            v3_reviewed = {'validate_ui_startup_contract': '8b83f487f75069ebb1ddef4c094b56bd793c213a4e8a3880bad1b3adc53e1482',
+            # startup contract was re-reviewed for the configured-topology gate.
+            v3_reviewed = {'validate_ui_startup_contract': 'f1dea6fcd2084b3361dd73bdefbef738752f602bae201eeb6757de456baec388',
                            'add_ssh_bundle': 'b82b051f1e05d650aa5ac9387c7f1ed46b14e0ca3db86b7b1083382b57a976c1'}
             for name, digest in v3_reviewed.items():
                 self.assertEqual(hashlib.sha256(new_functions[name].encode()).hexdigest(), digest, name)
