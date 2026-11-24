@@ -1,0 +1,25 @@
+{
+  "name": "OpenThread Border Router agent",
+  "component": "otbr-agent",
+  "repository": "https://github.com/openthread/ot-br-posix.git",
+  "commit": "22d4f4e488b4f59cd2541ee5b4bee69591053609",
+  "tag": "thread-reference-20230119",
+  "license": "BSD-3-Clause",
+  "build": {
+    "architecture": "armv7",
+    "abi": "hard-float",
+    "cmake_options": {
+      "BUILD_TESTING": "OFF",
+      "OTBR_BORDER_AGENT": "ON",
+      "OTBR_BORDER_ROUTING": "OFF",
+      "OTBR_DBUS": "OFF",
+      "OTBR_MDNS": "OFF",
+      "OTBR_REST": "OFF",
+      "OTBR_WEB": "OFF",
+      "OT_REFERENCE_DEVICE": "OFF"
+    },
+    "outputs": ["otbr-agent", "ot-ctl"],
+    "install": "/usr/local/sbin"
+  },
+  "note": "Source-only pin.  The built binary is part of the userspace image; the RCP GBL it drives is never packaged."
+}

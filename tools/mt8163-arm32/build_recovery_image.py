@@ -766,6 +766,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
             "usr/local/sbin/libreecho-recovery-net-down", 0o755,
         ),
         "libreecho-mdnsd": ("etc/init.d/libreecho-mdnsd.init", 0o755),
+        "libreecho-threadd": ("etc/init.d/libreecho-threadd.init", 0o755),
         "libreecho-reconcile-features": (
             "usr/local/sbin/libreecho-reconcile-features", 0o755,
         ),
