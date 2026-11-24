@@ -1,0 +1,222 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          libreecho-threadd
+# Required-Start:    $network
+# Required-Stop:     $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+### END INIT INFO
+#
+# Thread border router for the Lidar EFR32 radio.
+#
+# The per-unit radio choice is the "radio" string in the product settings file
+# (/data/libreecho/config/web-config.json): thread, zigbee or none.  This
+# service only handles thread; zigbee and none leave the radio alone.
+#
+# The RCP GBL is an owner-local payload with no home in an image: it is read
+# from /data/libreecho/firmware/lidar-ot-rcp.gbl and is never packaged.  If it
+# is missing the service logs that and exits without starting the agent.
+#
+# otbr-agent publishes the Thread border agent through Avahi.  The platform
+# already runs one Avahi/D-Bus responder under the libreecho-mdnsd supervisor,
+# and a second responder on the same host races the first for multicast DNS,
+# so this service joins that stack instead of starting its own.
+
+DAEMON=${DAEMON:-/usr/local/sbin/otbr-agent}
+PIDFILE=${PIDFILE:-/var/run/libreecho-threadd.pid}
+LOGFILE=${LOGFILE:-/var/log/libreecho-threadd.log}
+CONFIG=${CONFIG:-/data/libreecho/config/web-config.json}
+GBL=${GBL:-/data/libreecho/firmware/lidar-ot-rcp.gbl}
+STATE=${STATE:-/data/libreecho/thread}
+RADIO_URL=${RADIO_URL:-spinel+hdlc+uart:///dev/ttyS2?uart-baudrate=115200}
+INTERFACE=${INTERFACE:-wlan0}
+THREAD_IF=${THREAD_IF:-wpan0}
+EFR32=${EFR32:-/usr/local/sbin/lidar-efr32}
+# The shared responder is boot-contained Platform infrastructure; these paths
+# are the same ones /etc/init.d/libreecho-mdnsd.init and the AirPlay wrapper
+# use.  Bus ownership stays with that supervisor: this service never starts,
+# stops or configures Avahi or D-Bus.
+MDNS_INIT=${MDNS_INIT:-/etc/init.d/libreecho-mdnsd.init}
+MDNS_RUNTIME_ROOT=${MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root}
+MDNS_BUS_SOCKET=${MDNS_BUS_SOCKET:-$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket}
+MDNS_START_TIMEOUT=${MDNS_START_TIMEOUT:-15}
+
+log() { echo "libreecho-threadd: $*" > /dev/kmsg 2>/dev/null || true; }
+
+radio_choice() {
+    choice=none
+    if [ -r "$CONFIG" ]; then
+        choice=$(sed -n 's/.*"radio"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' \
+            "$CONFIG" 2>/dev/null | sed -n '1p')
+    fi
+    case "$choice" in
+        thread|zigbee|none) printf '%s\n' "$choice" ;;
+        *) printf 'none\n' ;;
+    esac
+}
+
+# `version` reads the UART only, so the probe works while the radio holder
+# below owns the two control lines.
+rcp_is_openthread() {
+    version=$("$EFR32" version 2>/dev/null) || return 1
+    case "$version" in
+        *4f50454e544852454144*) return 0 ;;  # "OPENTHREAD" in the Spinel reply
+    esac
+    return 1
+}
+
+running_pids() {
+    for entry in /proc/[0-9]*; do
+        candidate=${entry#/proc/}
+        [ "$candidate" = "$$" ] && continue
+        [ -r "$entry/cmdline" ] || continue
+        argv0=$(tr '\0' '\n' < "$entry/cmdline" 2>/dev/null | sed -n '1p')
+        [ "$argv0" = "$DAEMON" ] && printf '%s\n' "$candidate"
+    done
+}
+
+pidfile_pid() {
+    [ -s "$PIDFILE" ] || return 1
+    pid=$(sed -n '1p' "$PIDFILE")
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
+is_running() { pidfile_pid >/dev/null && return 0; [ -n "$(running_pids)" ]; }
+
+helper_pidfile() { printf '/var/run/libreecho-threadd-%s.pid\n' "$1"; }
+
+pidfile_pid_of() {  # pidfile_pid_of <pidfile>
+    [ -s "$1" ] || return 1
+    pid=$(sed -n '1p' "$1")
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
+spawn() {  # spawn <pidfile> <binary> [args...]
+    pidfile=$1
+    binary=$2
+    shift 2
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        start-stop-daemon -S -b -m -p "$pidfile" -x "$binary" -- "$@"
+    else
+        setsid "$binary" "$@" </dev/null >>"$LOGFILE" 2>&1 &
+        echo "$!" >"$pidfile"
+    fi
+}
+
+stop_pidfile() {  # stop_pidfile <pidfile>
+    [ -s "$1" ] || return 0
+    pid=$(sed -n '1p' "$1")
+    case "$pid" in *[!0-9]*|'') rm -f "$1"; return 0 ;; esac
+    kill "$pid" 2>/dev/null
+    count=0
+    while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 5 ]; do sleep 1; count=$((count + 1)); done
+    kill -KILL "$pid" 2>/dev/null
+    rm -f "$1"
+}
+
+# RESET_N has no pull-up on this board: a released line parks the EFR32 in
+# reset (lab-notes/phase-06/hw-20261121/step25-efr32/result.md in the
+# libreecho-lidar-port archive).  `lidar-efr32 run` therefore stays alive and
+# keeps the line driven high; this pidfile is that holder.
+start_holder() {
+    pidfile=$(helper_pidfile radio)
+    if pidfile_pid_of "$pidfile" >/dev/null; then
+        return 0
+    fi
+    spawn "$pidfile" "$EFR32" run || { log "cannot start the EFR32 application"; return 1; }
+    count=0
+    while [ "$count" -lt 5 ] && ! pidfile_pid_of "$pidfile" >/dev/null; do
+        sleep 1
+        count=$((count + 1))
+    done
+    pidfile_pid_of "$pidfile" >/dev/null || { log "the EFR32 application did not start"; return 1; }
+}
+
+bring_up_radio() {
+    [ -x "$EFR32" ] || { log "efr32 tool missing"; return 1; }
+    # Until a holder drives RESET_N high the chip sits in reset, so a probe
+    # without one would fail and reflash a working RCP on every boot.
+    start_holder || return 1
+    rcp_is_openthread && return 0
+    [ -r "$GBL" ] || {
+        log "no OpenThread RCP answers and $GBL is missing"
+        stop_pidfile "$(helper_pidfile radio)"
+        return 1
+    }
+    # The bootloader upload drives both lines itself, so the holder lets go
+    # first; the upload releases them again on exit, so a new holder must
+    # come up before the application can answer.
+    stop_pidfile "$(helper_pidfile radio)"
+    log "uploading $GBL through the EFR32 bootloader"
+    "$EFR32" flash "$GBL" || { log "GBL upload failed"; return 1; }
+    log "GBL uploaded"
+    start_holder || return 1
+    rcp_is_openthread || { log "the RCP does not answer"; return 1; }
+}
+
+# Join the platform's single Avahi/D-Bus responder.  The wrapper owns the
+# lifecycle; asking it to start is idempotent and refuses to launch while a
+# competing responder exists, so a failure here is reported, never worked
+# around with a private daemon.
+ensure_discovery() {
+    [ -x "$MDNS_INIT" ] || { log "shared discovery wrapper is not on this image"; return 1; }
+    if [ ! -S "$MDNS_BUS_SOCKET" ]; then
+        "$MDNS_INIT" start >/dev/null 2>&1 || log "shared discovery start failed"
+    fi
+    count=0
+    while [ ! -S "$MDNS_BUS_SOCKET" ] && [ "$count" -lt "$MDNS_START_TIMEOUT" ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    [ -S "$MDNS_BUS_SOCKET" ] || { log "the shared D-Bus socket did not come up"; return 1; }
+    DBUS_SYSTEM_BUS_ADDRESS="unix:path=$MDNS_BUS_SOCKET"
+    export DBUS_SYSTEM_BUS_ADDRESS
+}
+
+start_service() {
+    is_running && { echo "already running"; return 0; }
+    choice=$(radio_choice)
+    [ "$choice" = thread ] || { log "radio choice is $choice"; echo "radio choice is $choice"; return 0; }
+    [ -x "$DAEMON" ] || { log "otbr-agent is not on this image"; return 0; }
+    mkdir -p "$STATE" "$(dirname "$PIDFILE")" "$(dirname "$LOGFILE")"
+    chmod 700 "$STATE"
+    bring_up_radio || return 1
+    if ! ensure_discovery; then
+        stop_pidfile "$(helper_pidfile radio)"
+        return 1
+    fi
+    # -I names the Thread netdev, -B the Wi-Fi backbone, and the Spinel URL is
+    # positional in the pinned ot-br-posix (src/agent/main.cpp PrintHelp).
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- \
+            -I "$THREAD_IF" -B "$INTERFACE" "$RADIO_URL" -d 5
+    else
+        setsid "$DAEMON" -I "$THREAD_IF" -B "$INTERFACE" "$RADIO_URL" -d 5 \
+            </dev/null >>"$LOGFILE" 2>&1 &
+        echo "$!" >"$PIDFILE"
+    fi
+}
+
+stop_service() {
+    if pidfile_pid >/dev/null; then
+        pid=$(pidfile_pid) && kill "$pid" 2>/dev/null
+        count=0
+        while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 5 ]; do sleep 1; count=$((count + 1)); done
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    for stray in $(running_pids); do kill "$stray" 2>/dev/null; done
+    rm -f "$PIDFILE"
+    stop_pidfile "$(helper_pidfile radio)"
+}
+
+case "${1:-}" in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) stop_service; start_service ;;
+    status) is_running && echo running || { echo stopped; exit 3; } ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

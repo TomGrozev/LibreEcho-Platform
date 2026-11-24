@@ -773,26 +773,30 @@ class LidarImageTests(unittest.TestCase):
         args = argparse.Namespace(target='lidar', lidar_efr32=Path('efr32'),
                                   otbr_agent=None)
         with self.assertRaises(SystemExit):
-            builder.validate_lidar_radio_inputs(parser, args)
+            builder.validate_lidar_thread_inputs(parser, args)
         args = argparse.Namespace(target='radar_puffin', lidar_efr32=Path('efr32'),
                                   otbr_agent=Path('agent'))
         with self.assertRaises(SystemExit):
             builder.validate_lidar_thread_inputs(parser, args)
         args = argparse.Namespace(target='lidar', lidar_efr32=Path('efr32'),
                                   otbr_agent=Path('agent'))
-        self.assertTrue(builder.validate_lidar_radio_inputs(parser, args))
+        self.assertTrue(builder.validate_lidar_thread_inputs(parser, args))
 
-    def test_radio_helpers_stage_only_the_two_tools(self):
-        stage = self.directory / 'radio-stage'
+    def test_thread_runtime_stages_only_on_lidar(self):
+        stage = self.directory / 'thread-stage'
         stage.mkdir()
-        efr32 = self.directory / 'lidar-efr32'
+        tool = self.directory / 'lidar-efr32'
+        tool.write_bytes(b'efr32 tool')
         agent = self.directory / 'otbr-agent'
-        efr32.write_bytes(b'efr32 tool')
         agent.write_bytes(b'otbr agent')
         manifest: dict[str, object] = {}
         with mock.patch.object(builder.shared, 'require_elf_contract',
                                return_value={}):
-            builder.add_lidar_radio_helpers(stage, manifest, efr32, agent)
+            builder.add_lidar_thread_runtime(stage, manifest, tool, agent)
+        init = stage / 'etc/init.d/libreecho-threadd.init'
+        self.assertEqual(init.read_bytes(),
+                         (HERE / 'thread' / 'libreecho-threadd').read_bytes())
+        self.assertEqual(stat.S_IMODE(init.stat().st_mode), 0o755)
         for name, data in (('lidar-efr32', b'efr32 tool'),
                            ('otbr-agent', b'otbr agent')):
             member = stage / 'usr/local/sbin' / name
@@ -800,8 +804,18 @@ class LidarImageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(member.stat().st_mode), 0o755)
             self.assertEqual(manifest['thread']['files'][name]['sha256'],
                              builder.sha256(data))
-        self.assertEqual(sorted(path.name for path in stage.rglob('*') if path.is_file()),
+        self.assertTrue(manifest['thread']['enabled'])
+        self.assertEqual(manifest['thread']['activation'], 'thread-radio-only')
+        self.assertEqual(manifest['thread']['discovery'], 'shared-avahi-dbus')
+        self.assertEqual(manifest['thread']['start_order'],
                          ['lidar-efr32', 'otbr-agent'])
+        # otbr-agent publishes through the platform responder, so the Thread
+        # payload carries no second Avahi/D-Bus owner of its own.
+        for relative in ('usr/local/sbin/dbus-daemon',
+                         'usr/local/sbin/avahi-daemon',
+                         'etc/dbus-1/system.conf',
+                         'etc/avahi/avahi-daemon.conf'):
+            self.assertFalse((stage / relative).exists())
         self.assertFalse(any(path.suffix == '.gbl' for path in stage.rglob('*')))
 
     def test_shared_overlay_never_stages_the_thread_runtime(self):
@@ -821,13 +835,14 @@ class LidarImageTests(unittest.TestCase):
         tool = self.directory / 'tool'
         tool.write_bytes(b'tool')
         with self.assertRaises(builder.BuildError):
-            builder.add_lidar_radio_helpers(stage, {}, tool, gbl)
-        # Radar and Biscuit share the sibling overlay; it must not grow a
-        # radio helper path just because the Lidar builder exists.
-        self.assertFalse(hasattr(builder.shared, 'add_lidar_radio_helpers'))
-        overlay = builder.SIBLING / 'initramfs'
-        self.assertFalse((overlay / 'otbr-agent').exists())
-        self.assertFalse((overlay / 'lidar-efr32').exists())
+            builder.add_lidar_thread_runtime(stage, {}, tool, gbl)
+        self.assertEqual(sorted(path.name for path in stage.rglob('*')
+                                if path.is_file()),
+                         ['libreecho-threadd.init'])
+
+    def test_verifier_requires_thread_records_when_enabled(self):
+        with self.assertRaises(verifier.VerifyError):
+            verifier.validate_thread({}, {'thread': {'enabled': True}})
 
     def test_add_lidar_wifi_firmware_stages_both_driver_names(self):
         stage = self.directory / 'wifi-stage'

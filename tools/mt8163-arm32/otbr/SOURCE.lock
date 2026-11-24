@@ -13,13 +13,43 @@
       "OTBR_BORDER_AGENT": "ON",
       "OTBR_BORDER_ROUTING": "OFF",
       "OTBR_DBUS": "OFF",
-      "OTBR_MDNS": "OFF",
+      "OTBR_MDNS": "avahi",
       "OTBR_REST": "OFF",
       "OTBR_WEB": "OFF",
       "OT_REFERENCE_DEVICE": "OFF"
     },
-    "outputs": ["otbr-agent", "ot-ctl"],
+    "outputs": ["otbr-agent", "ot-ctl", "dbus-daemon", "avahi-daemon"],
     "install": "/usr/local/sbin"
   },
-  "note": "Source-only pin.  The built binary is part of the userspace image; the RCP GBL it drives is never packaged."
+  "dependencies": [
+    {
+      "name": "expat",
+      "version": "2.6.4",
+      "license": "MIT",
+      "source_url": "https://github.com/libexpat/libexpat/releases/download/R_2_6_4/expat-2.6.4.tar.xz",
+      "source_sha256": "a695629dae047055b37d50a0ff4776d1d45d0a4c842cf4ccee158441f55ff7ee"
+    },
+    {
+      "name": "libdaemon",
+      "version": "0.14",
+      "license": "LGPL-2.1-or-later",
+      "source_url": "https://0pointer.de/lennart/projects/libdaemon/libdaemon-0.14.tar.gz",
+      "source_sha256": "fd23eb5f6f986dcc7e708307355ba3289abe03cc381fc47a80bca4a50aa6b834"
+    },
+    {
+      "name": "dbus",
+      "version": "1.14.10",
+      "license": "AFL-2.1 OR GPL-2.0-or-later",
+      "source_url": "https://dbus.freedesktop.org/releases/dbus/dbus-1.14.10.tar.xz",
+      "source_sha256": "ba1f21d2bd9d339da2d4aa8780c09df32fea87998b73da24f49ab9df1e36a50f"
+    },
+    {
+      "name": "avahi",
+      "version": "0.8",
+      "license": "LGPL-2.1-or-later",
+      "source_url": "https://github.com/lathiat/avahi/releases/download/v0.8/avahi-0.8.tar.gz",
+      "source_sha256": "060309d7a333d38d951bc27598c677af1796934dbd98e1024e7ad8de798fedda"
+    }
+  ],
+  "note": "Source-only pin.  The built binaries are part of the userspace image; the RCP GBL they drive is never packaged.  D-Bus and Avahi are linked statically with the publisher stack so the border agent owns no dynamic loader closure outside the musl userspace."
 }

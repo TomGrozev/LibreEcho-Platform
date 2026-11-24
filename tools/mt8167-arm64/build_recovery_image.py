@@ -661,16 +661,33 @@ def add_lidar_ota_tools(stage: Path, bootctl: Path, verifier: Path,
     }
 
 
-def add_lidar_radio_helpers(stage: Path, manifest: dict[str, object],
-                            efr32: Path, otbr_agent: Path) -> None:
-    """Stage the two binaries the thread service executes.
+THREAD_INIT = HERE / 'thread' / 'libreecho-threadd'
 
-    ``libreecho-threadd`` starts the EFR32 tool to bring the radio up and then
-    execs otbr-agent.  Neither the OpenThread RCP GBL nor any per-unit radio
-    payload belongs in an image, so only these two reviewed binaries are
-    copied and only for target ``lidar``.
+
+def add_lidar_thread_runtime(stage: Path, manifest: dict[str, object],
+                             efr32: Path, otbr_agent: Path) -> None:
+    """Stage the Lidar-only Thread border router runtime.
+
+    The EFR32 radio exists only on Lidar, so the init entry, the EFR32 tool
+    and otbr-agent are staged here and never by the shared MT8163 overlay.
+    ``lidar-efr32 run`` holds RESET_N high for the life of the border agent
+    (the line has no pull-up), and otbr-agent publishes through the one
+    Avahi/D-Bus responder that ``libreecho-mdnsd`` already supervises, so no
+    private daemon or daemon config is part of this payload.  Neither the
+    OpenThread RCP GBL nor any per-unit radio payload belongs in an image.
     """
-    records: dict[str, object] = {}
+    if THREAD_INIT.is_symlink() or not THREAD_INIT.is_file():
+        raise BuildError(f'the thread init entry is not a regular file: {THREAD_INIT}')
+    init_data = read(THREAD_INIT)
+    init_relative = 'etc/init.d/libreecho-threadd.init'
+    init_target = stage / init_relative
+    init_target.parent.mkdir(parents=True, exist_ok=True)
+    init_target.write_bytes(init_data)
+    init_target.chmod(0o755)
+    records: dict[str, object] = {
+        'libreecho-threadd': {'sha256': sha256(init_data), 'size': len(init_data),
+                              'path': '/' + init_relative, 'mode': '0755'},
+    }
     sources = (('lidar-efr32', efr32), ('otbr-agent', otbr_agent))
     for name, source in sources:
         if source.is_symlink() or not source.is_file():
@@ -687,8 +704,12 @@ def add_lidar_radio_helpers(stage: Path, manifest: dict[str, object],
         elf = shared.require_elf_contract(destination, 0x05000400, None, (), False)
         records[name] = {'sha256': sha256(data), 'size': len(data),
                          'path': '/' + relative, 'elf': elf}
-    manifest['radio_helpers'] = {'activation': 'radio-setting-thread-only',
-                                 'files': records}
+    manifest['thread'] = {'enabled': True,
+                          'activation': 'thread-radio-only',
+                          'start_order': ['lidar-efr32', 'otbr-agent'],
+                          'discovery': 'shared-avahi-dbus',
+                          'init': '/' + init_relative,
+                          'files': records}
 
 
 def add_lidar_network(stage: Path, manifest: dict[str, object],
@@ -802,9 +823,9 @@ def disabled_ssh_record() -> dict[str, object]:
     }
 
 
-def validate_lidar_radio_inputs(parser: argparse.ArgumentParser,
-                                args: argparse.Namespace) -> bool:
-    """Radio helpers belong to Lidar only and are staged as a pair."""
+def validate_lidar_thread_inputs(parser: argparse.ArgumentParser,
+                                 args: argparse.Namespace) -> bool:
+    """The Thread runtime belongs to Lidar only and is staged as a whole."""
     values = (args.lidar_efr32, args.otbr_agent)
     if any(value is not None for value in values) and not all(
             value is not None for value in values):
@@ -999,9 +1020,10 @@ def main() -> None:
                             args.target_descriptor_sha256)
         add_lidar_wifi_firmware(stage, manifest, args.wifi_patch.resolve(),
                                 args.wifi_licence.resolve())
-        if radio_helpers_enabled:
-            add_lidar_radio_helpers(stage, manifest, args.lidar_efr32.resolve(),
-                                    args.otbr_agent.resolve())
+        if thread_runtime_enabled:
+            add_lidar_thread_runtime(stage, manifest,
+                                     args.lidar_efr32.resolve(),
+                                     args.otbr_agent.resolve())
         if args.wpa_supplicant is not None:
             add_lidar_network(stage, manifest, args.wpa_supplicant.resolve())
         audio_labels = ('tinyplay', 'tinycap', 'tinymix')
