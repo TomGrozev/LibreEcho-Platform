@@ -2141,7 +2141,7 @@ class PolicyTests(unittest.TestCase):
         )) + "\n"
         valid_web = "\n".join((
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
-            "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-30}",
+            "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-5}",
             "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
             "bluetooth_integration_state() {",
             "    printf 'disabled\\n'",
@@ -2327,7 +2327,7 @@ class PolicyTests(unittest.TestCase):
 
             one_shot_web = valid_web
             for marker in (
-                "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-30}\n",
+                "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-5}\n",
                 "    while :; do\n",
                 '        sleep "$delay"\n',
                 "        delay=$((delay * 2))\n",

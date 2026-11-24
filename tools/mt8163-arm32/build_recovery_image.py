@@ -1163,7 +1163,7 @@ def validate_ui_startup_contract(bundle: Path) -> None:
         (
             "etc/init.d/libreecho-web.init",
             (
-                "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-30}",
+                "STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-5}",
                 "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
                 "bluetooth_integration_state()",
                 "bluetooth_ready()",
