@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Boot-chain generation guard for the Lidar installers.
 
-Platform ``AGENTS.md`` "Boot-chain safety" rule 2 (AGENTS.md:84-88) requires the
-chain generation to be established before any flash write: on the amonet v2.0.0
+Platform ``AGENTS.md`` "Boot-chain safety" rule 2 requires the chain
+generation to be established before any flash write: on the amonet v2.0.0
 chain ``expdb[0:16]`` starts with the MTK image header of the Kaeru LK-stage
 patch payload.  A legacy ``FASTBOOT_PLEASE`` marker there means the chain is
 already broken, and writing flash from that state is forbidden.
@@ -15,7 +15,7 @@ one decision, so a new caller cannot invent a weaker test.
 
 EXPDB_PREFIX_BYTES = 16
 # MediaTek image header magic 0x58881688, little endian, as every MTK stage
-# image begins (lab phase-01/boot-chain-analysis.md:126).
+# image begins.
 MTK_IMAGE_MAGIC = b'\x88\x16\x88\x58'
 FASTBOOT_PLEASE = b'FASTBOOT_PLEASE'
 CHAIN_GENERATION = 'kaeru-v2'

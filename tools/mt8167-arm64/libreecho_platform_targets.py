@@ -13,10 +13,8 @@ import re
 
 DEFAULT_TARGET = 'lidar'
 
-# Partition geometry from the live GPT dump
-# (lab-notes/phase-01/brom-printgpt.log:123-142 in the
-# https://github.com/TomGrozev/libreecho-lidar-port archive), as (number,
-# name, size in 512-byte sectors).  The Lidar layout has no recovery
+# Partition geometry from the live GPT dump, as (number, name, size in
+# 512-byte sectors).  The Lidar layout has no recovery
 # partition, and its 512 KiB misc partition distinguishes it from the MT8163
 # layout (misc 1025 sectors, recovery at p12).
 STORAGE_SECTOR_SIZE = 512

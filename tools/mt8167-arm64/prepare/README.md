@@ -1,8 +1,7 @@
 # Lidar preparation command
 
-`lidar_prepare.py` is the reviewed replacement for the hand-run BROM session
-described in `lab-notes/phase-07/prep-command.md` (libreecho-lidar-port
-repository).  It takes the boot-chain backup, runs the same-byte restore drill
+`lidar_prepare.py` is the reviewed replacement for the hand-run BROM session.
+It takes the boot-chain backup, runs the same-byte restore drill
 and stock-boot gate, installs the owner-access chain, and confirms Kaeru
 fastboot.  It writes only boot-chain areas and never writes BOOT1 or expires
 the `expdb` rule.
@@ -31,19 +30,19 @@ BOOT0; any other installed expdb content is refused.
 python3 lidar_prepare.py --amonet /opt/amonet identify
 
 python3 lidar_prepare.py \
-    backup --backup-dir /tmp/lidar-backup-20261124
+    backup --backup-dir lidar-backup
 
 python3 lidar_prepare.py \
-    drill --backup-dir /tmp/lidar-backup-20261124 --yes
+    drill --backup-dir lidar-backup --yes
 
 # Power-cycle to a normal stock boot, then:
-python3 lidar_prepare.py stock-boot --report /tmp/lidar-stock-boot.json
+python3 lidar_prepare.py stock-boot --report lidar-stock-boot.json
 
 # Back in BROM:
 python3 lidar_prepare.py \
-    install --backup-dir /tmp/lidar-backup-20261124 \
-    --drill-report /tmp/lidar-backup-20261124/drill-report.json \
-    --stock-boot-report /tmp/lidar-stock-boot.json \
+    install --backup-dir lidar-backup \
+    --drill-report lidar-backup/drill-report.json \
+    --stock-boot-report lidar-stock-boot.json \
     --kaeru lidar-kaeru.bin --kaeru-sha256 <hex> \
     --koboreru tee-payload-lidar.img --koboreru-sha256 <hex> --yes
 
@@ -65,7 +64,7 @@ Amonet CLI for every read and write.
 
 ```sh
 python3 lidar_prepare.py --amonet /opt/amonet run \
-    --session-dir /tmp/lidar-prep-20261124 \
+    --session-dir lidar-session \
     --kaeru ... --kaeru-sha256 ... \
     --koboreru ... --koboreru-sha256 ... --yes --stock-boot-ok
 ```
@@ -87,8 +86,8 @@ checkout) and never shipped:
 
 ```sh
 python3 lidar_donor_artifacts.py \
-    --backup-dir /mnt/backup/lidar-backup-20261124 \
-    --out /mnt/backup/lidar-chain \
+    --backup-dir lidar-backup \
+    --out lidar-chain \
     --koboreru tee-payload-lidar.img --koboreru-sha256 <hex>
 ```
 
@@ -103,7 +102,7 @@ directory.
 The stock Zigbee GBLs are captured from a host dump, never a device:
 
 ```sh
-python3 capture_stock_gbls.py --source /mnt/dump/stock/system_a_rootfs \
+python3 capture_stock_gbls.py --source dump/system_a_rootfs \
     --out ../../../local-firmware
 ```
 
@@ -117,8 +116,7 @@ or eMMC boot header, a Gecko GBL header, an EFR32 radio name, or a digest from
 
 ## Chain layout
 
-Grounded in `lab-notes/phase-03/notes.md` (libreecho-lidar-port repository),
-including its "Session 2: chain install" record:
+The chain install order:
 
 1. `expdb` gets the source-built Kaeru LK stage padded with zeros to 0x40000.
 2. A fresh `expdb[0:16]` read must pass `install/expdb_guard.py:check_expdb_prefix`.
@@ -129,8 +127,8 @@ including its "Session 2: chain install" record:
 5. BOOT1 (area 2) is read before and after and must be unchanged.
 
 The backup's preloader must hash to the reviewed 2019 signed image
-(`fb987ad9...`), the only layout the Koboreru patch sites were derived from
-(`lab-notes/phase-03/notes.md`).  Any other preloader is refused: taking a
+(`fb987ad9...`), the only layout the Koboreru patch sites were derived from.
+Any other preloader is refused: taking a
 different one is an owner decision, not a command-line flag.
 
 ## Tests

@@ -25,8 +25,7 @@ import lidar_install as li  # noqa: E402
 import expdb_guard  # noqa: E402
 
 # The reviewed v2.0.0 expdb prefix: an MTK LK image header (magic, LE32 data
-# size, "LK"), as in the lab's phase-03 expdb sources.  The size differs between
-# builds, so only the magic is compared.
+# size, "LK").  The size differs between builds, so only the magic is compared.
 EXPDB_V2_PREFIX = bytes.fromhex('88168858d0400300') + b'LK\0\0\0\0\0\0'
 EXPDB_BROKEN_PREFIX = b'FASTBOOT_PLEASE\0'
 

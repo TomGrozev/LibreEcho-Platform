@@ -2,8 +2,7 @@
 """Capture the stock EFR32 Zigbee GBLs from a host-side dump into local-firmware/.
 
 The Echo Plus 2nd Gen ships two Amazon-signed GBL images in its stock system
-partition (lab-notes/phase-06/hw-20261121/step25-efr32/result.md in the
-libreecho-lidar-port repository):
+partition:
 
     system/vendor/firmware/silabs/xncp-fw.gbl       Zigbee NCP
     system/vendor/firmware/dsr/zb_mux_rcp.gbl       Zigbee/Thread mux RCP
@@ -15,7 +14,7 @@ device node, verifies the known size and sha256, and writes the files under
 
 Usage:
 
-    python3 capture_stock_gbls.py --source /mnt/dump/stock/system_a_rootfs
+    python3 capture_stock_gbls.py --source dump/system_a_rootfs
 """
 from __future__ import annotations
 
@@ -43,7 +42,7 @@ class CaptureEntry:
     sha256: str
 
 
-# Pins from the read-only system_a read on 2026-11-21.
+# Pins from the reviewed stock system_a rootfs.
 CAPTURE_SET: tuple[CaptureEntry, ...] = (
     CaptureEntry(
         source="system/vendor/firmware/silabs/xncp-fw.gbl",

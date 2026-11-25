@@ -65,8 +65,7 @@ def require_simulator() -> None:
         _skip(f"reviewed Lidar backup not present at {LIDAR_SIM}")
 
 
-# Live GPT offsets (lab-notes/phase-01/brom-printgpt.log:123-142, in the
-# libreecho-lidar-port archive).
+# Live GPT offsets.
 OFFSETS = {
     "kb": 0x100000, "dkb": 0x200000, "lk_a": 0x300000, "tee1": 0x400000,
     "lk_b": 0x900000, "tee2": 0xA00000, "expdb": 0xF00000, "misc": 0x1900000,

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Reviewed preparation command for the Echo Plus 2nd Gen (Lidar, MT8167).
 
-This is the reviewed replacement for the hand-run BROM session described in
-the public lab notes (``lab-notes/phase-07/prep-command.md`` in the
-libreecho-lidar-port repository).  It has one subcommand per stage and ``run``
+This is the reviewed replacement for the hand-run BROM session.  It has one
+subcommand per stage and ``run``
 chains them:
 
     identify   BROM identity is MT8167 and the GPT is the Lidar geometry
@@ -20,13 +19,11 @@ device command instead of running it.
 Evidence this file leans on:
 
 * Backup set, sizes and offsets: ``install/lidar_backup_set.py``; the sources
-  are the stock dump and the live BROM reads
-  (``lab-notes/phase-01/notes.md``).
-* Drill areas and order: ``lab-notes/phase-03/notes.md`` (gpt, gpt_backup,
-  expdb, tee1, boot0; boot1 is never written).
-* Stock-boot gate: ``lab-notes/phase-03/notes.md``.
-* Chain layout and order: ``lab-notes/phase-03/notes.md``
-  (expdb -> tee1 -> BOOT0 area 1, sector 0 last).
+  are the stock dump and the live BROM reads.
+* Drill areas and order: gpt, gpt_backup, expdb, tee1, boot0; boot1 is never
+  written.
+* Stock-boot gate: the unit must still start the stock system after the drill.
+* Chain layout and order: expdb -> tee1 -> BOOT0 area 1, sector 0 last.
 * expdb generation: ``install/expdb_guard.py`` and Platform ``AGENTS.md``.
 * Lidar identity and partition sizes: ``libreecho_platform_targets.py``;
   the installer's product check is ``install/lidar_install.py``.
@@ -75,9 +72,8 @@ SCHEMA_BACKUP = backup.SCHEMA
 SCHEMA_DRILL = "libreecho-lidar-drill-v1"
 SCHEMA_STOCK_BOOT = "libreecho-lidar-stock-boot-v1"
 
-# The same-byte drill order proven on the unit (drill.json:13-79 and
-# phase-03/notes.md:54-111): boot0 is last and its sector 0 is written after
-# its body.  boot1 is verified and never written.
+# The same-byte drill order proven on the unit: boot0 is last and its sector 0
+# is written after its body.  boot1 is verified and never written.
 DRILL_ORDER = ("gpt", "gpt_backup", "expdb", "tee1", "boot0")
 NEVER_WRITE = frozenset({"boot1"})
 # expdb is written exactly twice by design: the same-byte drill and the one
@@ -446,7 +442,7 @@ def stage_drill(adapter, log: JsonlLog, backup_dir: Path, manifest_path: Path,
 
 def stage_stock_boot(log: JsonlLog, report_path: Path, *, dry_run: bool,
                      confirmed: bool, prompt=input) -> None:
-    print("Stock-boot check (lab-notes/phase-03/notes.md):")
+    print("Stock-boot check:")
     print("  1. Power the unit off and remove power.")
     print("  2. Apply power without USB and watch for a normal stock startup.")
     print("  3. Remove power again, then hold the Action button and apply power")

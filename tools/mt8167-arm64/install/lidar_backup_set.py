@@ -6,26 +6,21 @@ fastboot or BROM operation: the reviewed preparation command that reads these
 areas is out of scope, and calls the data and ``verify_backup_set`` defined
 here.
 
-The set is derived from the lab evidence, not from the reference kit:
+The set is derived from the stock GPT and boot-chain layout, not from the
+reference kit:
 
-* GPT layout: ``lab-notes/phase-01/brom-printgpt.log:123-142`` in the
-  libreecho-lidar-port archive.
-* Boot areas 1 and 2 are each 2 MiB; the drill pins both
-  (``lab-notes/phase-03/manifests/drill.json:57-79``) and the restore manifest
-  marks boot area 2 ``never_write``
-  (``lab-notes/phase-02/restore/lidarrestore/manifest.py`` partition kinds).
+* GPT layout: the primary header is at offset 512 and the entry array at
+  LBA 2, in a 0x1C8000000-byte (7650410496) flash.
+* Boot areas 1 and 2 are each 2 MiB; the drill pins both and the restore
+  manifest marks boot area 2 ``never_write``.
 * The primary GPT is read as 0x16000 bytes from LBA 0 (header at offset 512,
-  entries at LBA 2): the ``gpt.bin`` entry in
-  ``lab-notes/phase-01/manifest.json``.
+  entries at LBA 2).
 * The backup GPT is 0x4200 bytes at absolute 0x1C7FFBE00 (entries at
-  LBA 0xE3FFDF through the header at LBA 0xE3FFFF): the ``gpt_backup.bin``
-  entry in ``lab-notes/phase-01/manifest.json`` and
-  ``lab-notes/phase-03/notes.md`` ("Addresses").
+  LBA 0xE3FFDF through the header at LBA 0xE3FFFF).
 * ``expdb`` holds the Kaeru LK stage after installation and must never be
   erased or written again (Platform ``AGENTS.md`` "Boot-chain safety").  Its
   stock contents are therefore part of the pre-install backup.
-* ``persist`` is a real GPT partition
-  (``lab-notes/phase-01/brom-printgpt.log:133``) and belongs to the
+* ``persist`` is a real GPT partition at 0x1980000 and belongs to the
   pre-install backup.  This board has no ``nvram`` partition, so none is
   listed.
 
@@ -44,9 +39,9 @@ from typing import Any
 
 SCHEMA = "libreecho-lidar-backup-v1"
 SECTOR_BYTES = 512
-FLASH_BYTES = 0x1C8000000  # 7650410496; brom-printgpt.log:142
+FLASH_BYTES = 0x1C8000000  # 7650410496 bytes
 BOOT_AREA_BYTES = 0x200000  # 2 MiB per eMMC boot area
-GPT_PRIMARY_BYTES = 0x16000  # primary GPT read, phase-01 manifest
+GPT_PRIMARY_BYTES = 0x16000  # header plus 32 entry sectors
 GPT_BACKUP_OFFSET = 0x1C7FFBE00  # flash_bytes - 0x4200
 GPT_BACKUP_BYTES = 0x4200  # 33 sectors: 32 entry sectors + header
 

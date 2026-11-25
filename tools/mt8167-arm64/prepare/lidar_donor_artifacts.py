@@ -53,9 +53,9 @@ SECTOR_BYTES = backup.SECTOR_BYTES
 MTK_IMAGE_MAGIC = b"\x88\x16\x88\x58"
 PRELOADER_MAGIC = b"EMMC_BOOT"
 STOCK_TEE_TYPE = b"atf"
-# The 2019 signed preloader area 1 the Koboreru offsets were derived from
-# (lab-notes/phase-03/notes.md).  A different preloader has no reviewed
-# patch sites, so it needs an owner decision, not a flag.
+# The 2019 signed preloader area 1 the Koboreru offsets were derived from.
+# A different preloader has no reviewed patch sites, so it needs an owner
+# decision, not a flag.
 REVIEWED_PRELOADER_SHA256 = (
     "fb987ad9cd2af5e4d86e6476f1f154e555795d915d247a23110b80ed0363de45")
 LOCAL_ROOTS = frozenset({"private", "local", "local-firmware"})
@@ -117,8 +117,8 @@ def _check_preloader(preloader: bytes, expected_sha256: str) -> None:
         raise Refusal(
             f"backup boot0 is {digest}, not the reviewed 2019 signed preloader "
             f"{expected_sha256}; its layout is the only one the Koboreru patch "
-            "sites were derived from (lab-notes/phase-03/notes.md). A different "
-            "preloader needs an owner decision, not a flag")
+            "sites were derived from. A different preloader needs an owner "
+            "decision, not a flag")
 
 
 def _check_stock_tee1(stock_tee1: bytes) -> None:

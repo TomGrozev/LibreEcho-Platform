@@ -53,8 +53,7 @@ verifier rejects the member unless it is static ARM32 hard-float and matches
 
 ## Boot envelope
 
-The builder reproduces `lab-notes/phase-04/pack_boot.py` from the
-libreecho-lidar-port archive:
+The builder emits the stock boot envelope:
 
 - 16 MiB Android v0 image, page size 2048, header version 0.
 - kernel address `0x40080000`, ramdisk `0x44000000`, second `0x40F00000`,
@@ -117,9 +116,8 @@ python3 tools/mt8167-arm64/build_recovery_image.py \
 
 `--stock-boot` reads the stock kernel command line and MediaTek header.  Use
 `--stock-dtb-collection <19-dtb-concatenation>` instead when only the appended
-trees are available; the builder then uses the proven stock command line
-constant from `lab-notes/phase-01/dtb/boot-parse.json` in the
-libreecho-lidar-port archive.  The two source flags
+trees are available; the builder then uses its built-in proven stock command
+line constant.  The two source flags
 are mutually exclusive.  `--expected-stock-dtb-collection-sha256` and
 `--expected-stock-pvt-sha256` default to the pinned values.
 
@@ -137,8 +135,8 @@ The builder refuses to overwrite an existing output, ramdisk or manifest.
 explicit error because they are MT8163 payloads.
 
 `--wifi-patch` and `--wifi-licence` are required.  The patch must be the
-170990-byte linux-firmware `mt7668pr2h.bin`
-(`465ed634...aec4cc9`).  The builder stages the same bytes as
+170990-byte linux-firmware `mt7668pr2h.bin` from tag `20261019`.  The builder
+stages the same bytes as
 `lib/firmware/mediatek/mt7668pr2h.bin` for the WLAN driver and
 `lib/firmware/mt7668_patch_e2_hdr.bin` for `btmtksdio`, plus
 `lib/firmware/LICENCE.mediatek` and the shipped
@@ -161,8 +159,7 @@ The Thread border router is Lidar-only, because only Lidar has the EFR32 radio:
   the other is refused, and both are refused outside `--target lidar`.
 - The service takes the radio only when the persisted `radio` setting is
   `thread`. `lidar-efr32 run` holds `RESET_N` high for the lifetime of the
-  border agent, because the line has no pull-up
-  (`lab-notes/phase-06/hw-20261121/step25-efr32/result.md`).
+  border agent, because the line has no pull-up.
 - otbr-agent publishes through the one Avahi/D-Bus responder that
   `/etc/init.d/libreecho-mdnsd.init` supervises. No private `dbus-daemon`,
   `avahi-daemon` or daemon config is staged: a second responder would race

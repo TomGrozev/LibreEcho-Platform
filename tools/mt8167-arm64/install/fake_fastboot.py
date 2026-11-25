@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """A fake Lidar Kaeru fastboot, used only by the installer tests.
 
-It emulates the surface the installer drives: the getvar answers measured on
-the unit (lab-notes/phase-04/hw-20261117-k1-fetch-diag/getvar.log:1 and
-lab-notes/phase-04/hw-20261117-k1-acm-flash/getvar-before.log:20-52 in the
-libreecho-lidar-port archive), `oem fetch-enable`, raw and Android sparse
+It emulates the surface the installer drives: the getvar answers the unit
+reports, `oem fetch-enable`, raw and Android sparse
 flash, 1 MiB fetch chunks, and failures for unknown partitions.
 
 State lives under $FAKE_FASTBOOT_STATE:

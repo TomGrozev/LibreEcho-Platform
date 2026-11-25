@@ -29,10 +29,8 @@ Global options come before the subcommand:
 
 ### check
 
-Read-only.  Requires `getvar product` to be `LIDAR` (the value measured in
-`lab-notes/phase-04/hw-20261117-k1-fetch-diag/getvar.log:1` in the
-[libreecho-lidar-port](https://github.com/TomGrozev/libreecho-lidar-port)
-archive) and `getvar kaeru-version` to answer (only Kaeru publishes it,
+Read-only.  Requires `getvar product` to answer `product: LIDAR`
+and `getvar kaeru-version` to answer (only Kaeru publishes it,
 `lib/common.c:62` in [kaeru](https://github.com/R0rt1z2/kaeru)).  It queries
 `max-fetch-size` and requires it to
 be at most 1 MiB, then queries `partition-size:<name>` for all 16 Lidar
@@ -70,8 +68,7 @@ and builds one allocation bit per block.  Only ext4-free runs become
 `DONT_CARE`; every allocated block is programmed, with all-zero allocated runs
 sent as `FILL` chunks.  A fresh filesystem's block bitmaps, inode tables, and
 journal are almost entirely zero, and skipping them left stale eMMC bytes that
-the mounted kernel read as ext4 metadata
-(`lab-notes/phase-05/hw-20261118/step3/dmesg-1.txt:311-314`).  For this
+the mounted kernel read as ext4 metadata.  For this
 partition that is about 147 MiB programmed (64 MiB journal plus inode tables),
 so `SPARSE_PROGRAMMED_MAX` is 192 MiB; a v1 generation image is larger and is
 delivered over adb instead of a single flash.
@@ -165,20 +162,18 @@ These are measurements, not code claims:
   bootctl, but Lidar's LK has not been observed booting `boot_b` from a
   priority-15 slot B record.
 - The USB `fetch:` range read.  Kaeru serves it and the protocol is the one in
-  `cmd_fetch.c`, but the installer has not driven it on a device yet; the
-  earlier readback used the stock client.
+  `cmd_fetch.c`, but the installer does not drive it; the readback below used
+  the stock client.
 
 ## Measured on hardware
 
-On 2026-11-18 a Lidar unit flashed the 4.93 GB sparse userdata image and read
-its 1 MiB prefix back, with the ext4 label `LIBREECHO_DATA` on both sides
-(`lab-notes/phase-05/hw-20261118/logs/install.log:190-197`).  That readback
-used the old prefix fetch: it stopped the client after the first chunk while
-Kaeru was already sending chunk 2, so the next command read a stale
-`product: 00100000` header from the abandoned stream
-(`lab-notes/phase-05/hw-20261118/logs/bcb-reset.log:5`) and the one after
-that failed with `Status read failed`.  Draining the bulk-in endpoint recovered
-the unit (`lab-notes/phase-05/hw-20261118/drain_bulk_in.py`).
+One Lidar unit has flashed the 4.93 GB sparse userdata image and read its
+1 MiB prefix back, with the ext4 label `LIBREECHO_DATA` on both sides.  That
+readback used the stock client: an early prefix fetch stopped the client after
+the first chunk while Kaeru was already sending chunk 2, so the next command
+read a stale `product: 00100000` header and the one after failed with
+`Status read failed`.  The installer therefore drains the bulk-in endpoint
+after a bounded read.
 
 ## Known integration point
 

@@ -4,32 +4,24 @@
 Kaeru is stock LK with patches: ``getvar`` answers the identity and geometry
 checks, ``fetch`` reads a partition back in at most 1 MiB pieces, and the stock
 ``flash`` path writes both raw and Android sparse images.  Facts this file
-relies on, with their evidence.  Kaeru is https://github.com/R0rt1z2/kaeru;
-``lab-notes/`` paths are the published lab notes in
-https://github.com/TomGrozev/libreecho-lidar-port.
+relies on.  Kaeru is https://github.com/R0rt1z2/kaeru.
 
-* ``getvar product`` answers ``product: LIDAR``
-  (lab-notes/phase-04/hw-20261117-k1-fetch-diag/getvar.log:1).
-  ``getvar kaeru-version`` answers ``kaeru-version: 2.0.0-...``
-  (lab-notes/phase-04/hw-20261117-k1-acm-flash/getvar-before.log:52), and only
-  Kaeru publishes that variable (kaeru ``lib/common.c:62``).
+* ``getvar product`` answers ``product: LIDAR``.  ``getvar kaeru-version``
+  answers ``kaeru-version: 2.0.0-...``, and only Kaeru publishes that variable
+  (kaeru ``lib/common.c:62``).
 * ``getvar partition-size:<name>`` answers hex bytes
-  (kaeru ``lib/fastboot/cmd_fetch.c:143-151``).  The values measured on the
-  unit are in getvar-before.log:20-47.
-* ``oem fetch-enable`` publishes ``max-fetch-size`` and is what the recorded
-  fetch procedure runs first (kaeru ``lib/fastboot/cmd_fetch.c:164-191``,
-  lab-notes/phase-04/hw-20261117-k1-fetch-diag/fetch.sh:14).
+  (kaeru ``lib/fastboot/cmd_fetch.c:143-151``).
+* ``oem fetch-enable`` publishes ``max-fetch-size`` and is what the stock
+  fetch procedure runs first (kaeru ``lib/fastboot/cmd_fetch.c:164-191``).
 * The fetch command is ``fetch:<name>[:<off>[:<len>]]`` and refuses more than
   0x100000 bytes per call (kaeru ``cmd_fetch.c:13,65-104``).  The stock
   fastboot client ``fetch PARTITION OUT_FILE`` therefore splits a partition
-  into 1 MiB calls
-  (lab-notes/phase-04/hw-20261117-k1-fetch-diag/fetch.log:3-18).
+  into 1 MiB calls.
 * That client has no range argument and asks for the next 1 MiB chunk as soon
   as the previous one lands, so stopping it after the first chunk leaves Kaeru
   inside a DATA phase; the next command then reads the abandoned stream instead
-  of its own reply (lab-notes/phase-05/hw-20261118/logs/bcb-reset.log:5).
-  ``install`` therefore speaks ``fetch:<name>:<off>:<len>`` over USB directly
-  for the userdata readback.
+  of its own reply.  ``install`` therefore speaks
+  ``fetch:<name>:<off>:<len>`` over USB directly for the userdata readback.
 * ``oem kaeru-version`` is registered at kaeru ``lib/fastboot/cmd_version.c:25``
   and prints ``kaeru v<version>``.
 
@@ -81,9 +73,7 @@ REQUIRED_SIZES = ('boot_a', 'boot_b', 'misc', 'userdata')
 EXPECTED_PRODUCT = 'LIDAR'
 MAX_FETCH_SIZE = 0x100000
 
-# Kaeru fastboot enumerates as this USB identity; measured with lsusb on the
-# attached unit (lab-notes/phase-05/hw-20261118 in the libreecho-lidar-port
-# archive).
+# Kaeru fastboot enumerates as this USB identity.
 LIDAR_FASTBOOT_VID = 0x0BB4
 LIDAR_FASTBOOT_PID = 0x0C01
 USB_READ_TIMEOUT_MS = 10000
@@ -130,11 +120,9 @@ SPARSE_BYTES = USERDATA_BYTES // SPARSE_BLOCK_SIZE * SPARSE_BLOCK_SIZE
 # 64 MiB journal and ~74 MiB of inode tables that the host once skipped, about
 # 147 MiB in total.  Those blocks must reach the device; skipping them left
 # stale eMMC bytes as live ext4 metadata and the kernel logged "block bitmap
-# and bg descriptor inconsistent"
-# (lab-notes/phase-05/hw-20261118/step3/dmesg-1.txt:311-314).  192 MiB
-# accepts the empty filesystem and stays below the size of a v1 generation
-# image, which is delivered over adb instead of a single flash
-# (lab-notes/phase-05/components.md).
+# and bg descriptor inconsistent".  192 MiB accepts the empty filesystem and
+# stays below the size of a v1 generation image, which is delivered over adb
+# instead of a single flash.
 SPARSE_PROGRAMMED_MAX = 192 * 1024 * 1024
 
 # mke2fs options shared by make_userdata and the sparse-allocation test.
@@ -274,8 +262,7 @@ class Fastboot:
         The stock client has no offset argument: it streams the whole partition
         and queues the next 1 MiB chunk the moment the previous one lands, so
         killing it after the first chunk leaves Kaeru mid-DATA and the next
-        command reads the abandoned stream (lab-notes/phase-05/hw-20261118/
-        logs/bcb-reset.log:5).  Asking for one range on the
+        command reads the abandoned stream.  Asking for one range on the
         USB link instead ends in Kaeru's OKAY and leaves the command state
         intact.
         """
@@ -406,7 +393,7 @@ def require_writable_partition(partition: str, *, bcb: bool = False) -> None:
 def require_kaeru_expdb_chain(fb: Fastboot, log: RunLog) -> str:
     """Establish the expdb chain generation before a flash write.
 
-    Platform AGENTS.md:84-88 (``Boot-chain safety`` rule 2): read
+    Platform AGENTS.md "Boot-chain safety" rule 2: read
     ``expdb[0:16]``; the MTK image magic means the v2.0.0 Kaeru payload is in
     place, an ASCII ``FASTBOOT_PLEASE`` means the chain is already broken.
     A short or failed read refuses exactly like a mismatch: the write path has
@@ -592,7 +579,7 @@ def write_sparse(raw_path: Path, output: Path, free: bytearray,
     allocated run is programmed.  Zeroed allocated blocks are FILL chunks, not
     skips: a fresh filesystem's inode tables, bitmaps and journal are all zero,
     and skipping them leaves stale bytes on eMMC that the mount then treats as
-    metadata (lab-notes/phase-05/hw-20261118/step3/dmesg-1.txt:311-314).
+    metadata.
 
     Only the first ``total_bytes`` (default ``SPARSE_BYTES``) are encoded; the
     raw tail is the ext4 slack past the last filesystem block and must be zero.
@@ -1138,8 +1125,8 @@ def install(boot: Path, boot_b: Path | None, userdata: Path | None, assume_yes: 
     if not assume_yes:
         raise Refusal('refusing to write without --yes')
 
-    # Every write below follows this check (AGENTS.md:84-88); there is no
-    # earlier flash in ``install`` that could run without it.
+    # Every write below follows this check (AGENTS.md "Boot-chain safety" rule
+    # 2); there is no earlier flash in ``install`` that could run without it.
     require_kaeru_expdb_chain(fb, log)
 
     writes = [('boot_a', boot), ('boot_b', second)]
