@@ -11,21 +11,49 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "install"))
 
+import amonet_adapter  # noqa: E402
 import lidar_backup_set as backup  # noqa: E402
 import lidar_prepare as prepare  # noqa: E402
 import mtk_adapter  # noqa: E402
+
+# The real adapter runs against the sibling Amonet fork and the reviewed Lidar
+# readback, both outside this checkout.  CI without them skips those cases; the
+# paths can be overridden with AMONET and LIDAR_BACKUP_DIR.
+PLATFORM_ROOT = HERE.parents[2]
+AMONET_CHECKOUT = Path(os.environ.get("AMONET")
+                       or PLATFORM_ROOT.parent / "amonet")
+LIDAR_SIM = Path(os.environ.get("LIDAR_BACKUP_DIR")
+                 or PLATFORM_ROOT.parents[1] / "dumps" / "20261110-lidar-readback")
+REVIEWED_DIGESTS = {
+    "boot0": "d5fc0bbbc89b7dfaa7ca39fc1d0bc8da0df4a66e2324f3a9742ba70c04f5e327",
+    "boot1": "4c8e02060ab820652000e4ffae90c5554d88230625edc704d269bee3efeb80f3",
+    "expdb": "e5b844cc57f57094ea4585e235f36c78c1cd222262bb89d53c94dcb4d6b3e55d",
+    "gpt": "7668e74b33f37cc06e73c99c9226d8b7f8f6259f2a7e4678378bf7e40196b682",
+    "gpt_backup": "07fda82bd175d93cacfd32e0c2f15ce141688856deffa9e67131cba721f0945c",
+    "tee1": "aa2b92914cf3dc8dcfebc958b99d752cb98bb20a79bf48570639587c838ad75e",
+}
+
+
+def require_simulator() -> None:
+    if not (AMONET_CHECKOUT / "modules" / "lidar_brom.py").is_file():
+        raise unittest.SkipTest(f"amonet checkout not present at {AMONET_CHECKOUT}")
+    if not LIDAR_SIM.is_dir():
+        raise unittest.SkipTest(f"reviewed Lidar backup not present at {LIDAR_SIM}")
+
 
 # Live GPT offsets (lab-notes/phase-01/brom-printgpt.log:123-142, in the
 # libreecho-lidar-port archive).
@@ -767,6 +795,303 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(adapter.identity())
         self.assertIsNone(adapter.read_area(backup.BY_NAME["expdb"]))
         adapter.write_absolute(backup.BY_NAME["expdb"].offset, b"\0" * 512)
+
+
+def printed_amonet_writes(output: str) -> list[tuple[str, str, int, int]]:
+    """Normalise the dry-run write commands to the fake adapter's tuples."""
+    writes = []
+    for line in output.splitlines():
+        if not line.startswith("DRY-RUN amonet: ") or " write " not in line:
+            continue
+        length = int(line.rsplit("#", 1)[1].split()[0])
+        tokens = line.split()
+        rest = tokens[tokens.index("write") + 1:]
+        area = rest[rest.index("--area") + 1] if "--area" in rest else None
+        offset = (int(rest[rest.index("--offset") + 1], 16)
+                  if "--offset" in rest else 0)
+        if area == "boot0":
+            writes.append(("boot1", "boot0", offset, length))
+        elif area is not None:
+            writes.append(("partition", area, offset, length))
+        else:
+            name = next(item.name for item in backup.BACKUP_SET
+                        if item.offset == offset
+                        and item.kind in ("user", "gpt", "gpt_backup"))
+            writes.append(("absolute", name, offset, length))
+    return writes
+
+
+class AmonetAdapterTests(unittest.TestCase):
+    """The real adapter against the Amonet simulator over the reviewed backup."""
+
+    def setUp(self):
+        require_simulator()
+        self.adapter = amonet_adapter.AmonetClient(
+            AMONET_CHECKOUT, simulate_dir=LIDAR_SIM)
+
+    def test_identity_matches_the_reviewed_lidar(self):
+        self.assertEqual(
+            self.adapter.identity(),
+            amonet_adapter.Identity(0x8167, backup.FLASH_BYTES,
+                                    backup.BOOT_AREA_BYTES, 512))
+        self.assertIn("--simulate", self.adapter.commands[0])
+
+    def test_read_area_tee1_reproduces_the_reviewed_digest(self):
+        data = self.adapter.read_area(backup.BY_NAME["tee1"])
+        self.assertEqual(hashlib.sha256(data).hexdigest(), REVIEWED_DIGESTS["tee1"])
+
+    def test_read_absolute_gpt_reproduces_the_reviewed_digest(self):
+        data = self.adapter.read_absolute(0, backup.GPT_PRIMARY_BYTES)
+        self.assertEqual(hashlib.sha256(data).hexdigest(), REVIEWED_DIGESTS["gpt"])
+
+    def test_read_area_boot0_reproduces_the_reviewed_digest(self):
+        data = self.adapter.read_area(backup.BY_NAME["boot0"])
+        self.assertEqual(hashlib.sha256(data).hexdigest(), REVIEWED_DIGESTS["boot0"])
+
+
+class AmonetAdapterCommandTests(unittest.TestCase):
+    """Command construction and refusals, without a device or a simulator."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "modules").mkdir()
+        (self.root / "modules" / "lidar_brom.py").write_text("")
+
+    def test_missing_checkout_names_the_flag(self):
+        with self.assertRaises(amonet_adapter.AdapterError) as caught:
+            amonet_adapter.AmonetClient(self.root / "absent")
+        self.assertIn("--amonet", str(caught.exception))
+        self.assertIn("AMONET", str(caught.exception))
+
+    def test_identity_command_carries_python_simulate_and_payload(self):
+        recorded = {}
+
+        def runner(cmd, **kwargs):
+            recorded["cmd"] = cmd
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                json.dumps({"hwcode": "0x8167", "user_bytes": backup.FLASH_BYTES,
+                            "boot1_bytes": backup.BOOT_AREA_BYTES,
+                            "sector_bytes": 512}), "")
+
+        adapter = amonet_adapter.AmonetClient(
+            self.root, python="/usr/bin/python3", simulate_dir="/tmp/sim",
+            payload="/tmp/payload.bin", runner=runner)
+        self.assertEqual(adapter.identity(),
+                         amonet_adapter.Identity(0x8167, backup.FLASH_BYTES,
+                                                 backup.BOOT_AREA_BYTES, 512))
+        cmd = recorded["cmd"]
+        self.assertEqual(cmd[:2],
+                         ["/usr/bin/python3", str(self.root / "modules" / "lidar_brom.py")])
+        self.assertEqual(cmd[2:5], ["--simulate", "/tmp/sim", "--payload"])
+        self.assertEqual(cmd[5], "/tmp/payload.bin")
+        self.assertEqual(cmd[6], "identity")
+
+    def test_commands_use_the_documented_syntax(self):
+        recorded = []
+
+        def runner(cmd, **kwargs):
+            recorded.append(cmd)
+            target = next((Path(part) for part in cmd if part.endswith("read.bin")),
+                          None)
+            if target is not None:
+                if "--length" in cmd:
+                    size = int(cmd[cmd.index("--length") + 1], 16)
+                else:
+                    size = backup.BY_NAME[cmd[cmd.index("--area") + 1]].size
+                target.write_bytes(b"\0" * size)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        adapter = amonet_adapter.AmonetClient(self.root, runner=runner)
+        adapter.read_area(backup.BY_NAME["boot0"])
+        adapter.read_area(backup.BY_NAME["gpt"])
+        adapter.write_partition("tee1", b"\0" * 512)
+        adapter.write_boot_area1(0x200, b"\0" * 512)
+        rendered = [" ".join(cmd) for cmd in recorded]
+        self.assertIn("read --area boot0 --output", rendered[0])
+        self.assertIn("read --offset 0x0 --length 0x16000", rendered[1])
+        self.assertIn("write --area tee1 --input", rendered[2])
+        self.assertTrue(rendered[2].endswith("--approve-write"))
+        self.assertIn("write --area boot0 --offset 0x200", rendered[3])
+        self.assertTrue(rendered[3].endswith("--approve-write"))
+
+    def test_refusals_match_the_mtk_adapter(self):
+        adapter = amonet_adapter.AmonetClient(
+            self.root, runner=lambda *args, **kwargs: self.fail("refusal ran the tool"))
+        with self.assertRaisesRegex(amonet_adapter.AdapterWriteRefused,
+                                    "refusing an empty write"):
+            adapter.write_absolute(0, b"")
+        with self.assertRaisesRegex(amonet_adapter.AdapterWriteRefused,
+                                    "boot area 2 is never writable"):
+            adapter.write_partition("boot1", b"\0" * 512)
+        with self.assertRaisesRegex(amonet_adapter.AdapterWriteRefused,
+                                    "512-byte aligned"):
+            adapter.write_partition("tee1", b"\0" * 100)
+
+    def test_a_tool_refusal_is_not_reported_as_a_failure(self):
+        def refuse(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 2, "", "refused: nope")
+
+        with self.assertRaises(amonet_adapter.AdapterWriteRefused):
+            amonet_adapter.AmonetClient(
+                self.root, runner=refuse).write_partition("tee1", b"\0" * 512)
+
+        # A refused read is a failed command, not a write refusal, and the
+        # message carries the command that failed.
+        with self.assertRaises(amonet_adapter.AdapterError) as caught:
+            amonet_adapter.AmonetClient(self.root, runner=refuse).read_absolute(0, 512)
+        self.assertIn("read --offset 0x0 --length 0x200", str(caught.exception))
+
+        def fail(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, "", "Traceback (most recent call last):")
+
+        with self.assertRaises(amonet_adapter.AdapterError):
+            amonet_adapter.AmonetClient(self.root, runner=fail).read_absolute(0, 512)
+
+
+class AmonetCommandTests(CommandCase):
+    """The preparation command over the real adapter and the simulated BROM."""
+
+    def setUp(self):
+        require_simulator()
+        super().setUp()
+
+    def amonet(self, *, dry_run=False):
+        return amonet_adapter.AmonetClient(
+            AMONET_CHECKOUT, simulate_dir=LIDAR_SIM, dry_run=dry_run)
+
+    def run_with(self, adapter, command, *extra):
+        return quiet_main(self.base(command, *extra),
+                          adapter_factory=lambda args: adapter)
+
+    def sim_backup(self):
+        directory = self.root / "sim-backup"
+        code, _out, err = self.run_with(
+            self.amonet(), "backup", "--backup-dir", str(directory))
+        self.assertEqual(code, 0, err)
+        return directory
+
+    def sim_prepared(self):
+        directory = self.sim_backup()
+        stock = self.root / "sim-stock.json"
+        code, _out, err = quiet_main(
+            self.base("stock-boot", "--report", str(stock), "--confirmed"))
+        self.assertEqual(code, 0, err)
+        drill = self.root / "sim-drill.json"
+        code, _out, err = self.run_with(
+            self.amonet(), "drill", "--backup-dir", str(directory),
+            "--report", str(drill), "--yes")
+        self.assertEqual(code, 0, err)
+        return directory, drill, stock
+
+    def run_args(self, session):
+        return ["--log", str(self.log), "run", "--session-dir", str(session),
+                "--kaeru", self.inputs["kaeru"],
+                "--kaeru-sha256", sha(Path(self.inputs["kaeru"])),
+                "--koboreru", self.inputs["koboreru"],
+                "--koboreru-sha256", sha(Path(self.inputs["koboreru"])),
+                "--yes", "--stock-boot-ok"]
+
+    def fastboot(self):
+        return lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, "product: LIDAR\n", "")
+
+    def test_identify_over_the_simulated_brom(self):
+        code, _out, err = self.run_with(self.amonet(), "identify")
+        self.assertEqual(code, 0, err)
+        events = [json.loads(line) for line in self.log.read_text().splitlines()]
+        ok = [event for event in events
+              if event["stage"] == "identify" and event["action"] == "ok"]
+        self.assertEqual(ok[-1]["hwcode"], "0x8167")
+
+    def test_backup_over_the_simulated_brom_reproduces_the_reviewed_digests(self):
+        directory = self.sim_backup()
+        manifest = directory / "backup-manifest.json"
+        self.assertEqual(backup.verify_backup_set(directory, manifest), ())
+        files = backup.load_manifest(manifest)
+        for name, digest in REVIEWED_DIGESTS.items():
+            self.assertEqual(files[name]["sha256"], digest, name)
+
+    def test_drill_over_the_simulated_brom_keeps_boot1(self):
+        _directory, drill, _stock = self.sim_prepared()
+        report = json.loads(drill.read_text())
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["boot1"], "verified-unchanged")
+
+    def test_install_planning_prints_the_fake_adapter_write_set(self):
+        directory, drill, stock = self.prepared()
+        code, _out, err = quiet_main(
+            self.install_args(directory, drill, stock), adapter_factory=self.factory)
+        self.assertEqual(code, 0, err)
+        expected = list(self.fake.writes)
+        self.assertTrue(expected)
+
+        args = self.install_args(directory, drill, stock)
+        args.insert(args.index("install"), "--dry-run")
+        code, out, err = quiet_main(
+            args, adapter_factory=lambda _args: self.amonet(dry_run=True))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(printed_amonet_writes(out), expected)
+
+    def test_run_dry_run_prints_the_fake_adapter_write_set(self):
+        code, _out, err = quiet_main(
+            self.run_args(self.root / "fake-session"),
+            adapter_factory=self.factory, fastboot_runner=self.fastboot())
+        self.assertEqual(code, 0, err)
+        expected = list(self.fake.writes)
+        self.assertTrue(expected)
+
+        session = self.root / "dry-session"
+        args = self.run_args(session)
+        args.insert(args.index("run"), "--dry-run")
+        code, out, err = quiet_main(
+            args, adapter_factory=lambda _args: self.amonet(dry_run=True),
+            fastboot_runner=self.fastboot())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(printed_amonet_writes(out), expected)
+        self.assertIn("DRY-RUN amonet: ", out)
+        self.assertFalse((session / "backup").exists())
+
+
+class AmonetSelectionTests(CommandCase):
+    def test_no_tool_named_refuses_and_names_both_flags(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AMONET", None)
+            os.environ.pop("MTKCLIENT", None)
+            code, _out, err = quiet_main(self.base("identify"))
+        self.assertEqual(code, 1)
+        for token in ("--amonet", "AMONET", "--mtkclient", "MTKCLIENT"):
+            self.assertIn(token, err)
+
+    def test_a_named_path_without_the_tool_refuses_with_the_same_code(self):
+        checkout = self.root / "empty-amonet"
+        checkout.mkdir()
+        args = ["--log", str(self.log), "--amonet", str(checkout), "identify"]
+        code, _out, err = quiet_main(args)
+        self.assertEqual(code, 1)
+        self.assertIn("--amonet", err)
+        self.assertIn("AMONET", err)
+
+    def test_the_environment_names_the_checkout_too(self):
+        checkout = self.root / "empty-amonet"
+        checkout.mkdir()
+        with mock.patch.dict(os.environ, {"AMONET": str(checkout)}):
+            code, _out, err = quiet_main(self.base("identify"))
+        self.assertEqual(code, 1)
+        self.assertIn("--amonet", err)
+
+    def test_amonet_wins_over_the_legacy_mtkclient_flag(self):
+        require_simulator()
+        args = ["--log", str(self.log),
+                "--amonet", str(AMONET_CHECKOUT),
+                "--mtkclient", str(self.root / "absent"),
+                "--dry-run", "identify"]
+        code, out, err = quiet_main(args)
+        self.assertEqual(code, 0, err)
+        self.assertIn("DRY-RUN amonet: ", out)
+        self.assertNotIn("DRY-RUN mtkclient: ", out)
 
 
 if __name__ == "__main__":

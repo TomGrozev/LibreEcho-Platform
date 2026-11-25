@@ -64,6 +64,7 @@ from host_io import (  # noqa: E402
     utc_stamp,
     write_bytes_atomic,
 )
+from amonet_adapter import AmonetClient  # noqa: E402
 from mtk_adapter import (  # noqa: E402
     AdapterError,
     AdapterWriteRefused,
@@ -683,9 +684,13 @@ def add_chain_inputs(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare a stock Lidar for the LibreEcho installer over BROM.")
+    parser.add_argument("--amonet", type=Path,
+                        help="amonet checkout (required here or in the AMONET "
+                             "environment variable)")
+    parser.add_argument("--amonet-python", type=Path,
+                        help="python for the amonet tool (default: this interpreter)")
     parser.add_argument("--mtkclient", type=Path,
-                        help="mtkclient checkout (required here or in the "
-                             "MTKCLIENT environment variable)")
+                        help="mtkclient checkout (legacy; the Amonet adapter is preferred)")
     parser.add_argument("--mtkclient-python", type=Path,
                         help="python for mtkclient (default: <checkout>/.venv/bin/python)")
     parser.add_argument("--workdir", type=Path,
@@ -742,10 +747,15 @@ def _default_log(args) -> Path:
 
 
 def _make_adapter(args):
+    amonet_root = args.amonet or os.environ.get("AMONET")
+    if amonet_root:
+        return AmonetClient(amonet_root, python=args.amonet_python,
+                            dry_run=args.dry_run)
     root = args.mtkclient or os.environ.get("MTKCLIENT")
     if not root:
         raise PrepareError(
-            "no mtkclient checkout: pass --mtkclient or set MTKCLIENT")
+            "no device tool checkout: pass --amonet (or set AMONET), or the "
+            "legacy --mtkclient (or MTKCLIENT)")
     workdir = args.workdir or (Path(args.session_dir) / "mtk-work"
                                if getattr(args, "session_dir", None)
                                else Path("lidar-prepare-work"))

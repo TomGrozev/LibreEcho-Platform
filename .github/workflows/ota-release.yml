@@ -291,6 +291,7 @@ jobs:
             tools/mt8167-arm64/prepare/capture_stock_gbls.py \
             tools/mt8167-arm64/prepare/lidar_donor_artifacts.py \
             tools/mt8167-arm64/prepare/lidar_prepare.py \
+            tools/mt8167-arm64/prepare/amonet_adapter.py \
             tools/mt8167-arm64/prepare/mtk_adapter.py \
             tools/mt8163-arm32/ota/make_ota_bundle.py \
             tools/mt8163-arm32/ota/feature_manifest.py \

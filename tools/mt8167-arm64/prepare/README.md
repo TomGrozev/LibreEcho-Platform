@@ -11,7 +11,7 @@ the `expdb` rule.
 
 | Command | Device access | Writes |
 | --- | --- | --- |
-| `identify` | `printgpt`, GPT and backup GPT reads | none |
+| `identify` | tool `identity`/`printgpt`, GPT and backup GPT reads | none |
 | `backup` | reads every `lidar_backup_set.py` area twice | host files only |
 | `drill` | reads, then writes identical bytes to the drill areas | gpt, gpt_backup, expdb, tee1, boot0 body, boot0 sector 0 last |
 | `stock-boot` | none | none; records the operator's confirmation |
@@ -28,20 +28,19 @@ BOOT0; any other installed expdb content is refused.
 ## Usage
 
 ```sh
-python3 lidar_prepare.py --mtkclient /opt/mtkclient \
-    --workdir /tmp/lidar-prepare-work identify
+python3 lidar_prepare.py --amonet /opt/amonet identify
 
-python3 lidar_prepare.py --workdir /tmp/lidar-prepare-work \
+python3 lidar_prepare.py \
     backup --backup-dir /tmp/lidar-backup-20261124
 
-python3 lidar_prepare.py --workdir /tmp/lidar-prepare-work \
+python3 lidar_prepare.py \
     drill --backup-dir /tmp/lidar-backup-20261124 --yes
 
 # Power-cycle to a normal stock boot, then:
 python3 lidar_prepare.py stock-boot --report /tmp/lidar-stock-boot.json
 
-# Back in BROM with a fresh work directory:
-python3 lidar_prepare.py --workdir /tmp/lidar-install-work \
+# Back in BROM:
+python3 lidar_prepare.py \
     install --backup-dir /tmp/lidar-backup-20261124 \
     --drill-report /tmp/lidar-backup-20261124/drill-report.json \
     --stock-boot-report /tmp/lidar-stock-boot.json \
@@ -51,19 +50,25 @@ python3 lidar_prepare.py --workdir /tmp/lidar-install-work \
 python3 lidar_prepare.py confirm --fastboot fastboot
 ```
 
-`--mtkclient` names the mtkclient checkout; `MTKCLIENT` in the environment
-serves the same purpose, and there is no built-in default.
+`--amonet` names the Amonet checkout; `AMONET` in the environment serves the
+same purpose, and there is no built-in default.  The adapter runs
+`modules/lidar_brom.py` from that checkout with this interpreter unless
+`--amonet-python` names another.  `--mtkclient`/`MTKCLIENT` still selects the
+legacy mtkclient adapter; `--amonet` wins when both are given, and
+`--workdir`/`--mtkclient-python` apply only to it.  With neither tool named
+the command exits 1 and the message names both flags and environment
+variables.
 
 `run` chains them with one session directory and `--yes`:
 
 ```sh
-python3 lidar_prepare.py --mtkclient /opt/mtkclient --workdir /tmp/lidar-empty run \
+python3 lidar_prepare.py --amonet /opt/amonet run \
     --session-dir /tmp/lidar-prep-20261124 \
     --kaeru ... --kaeru-sha256 ... \
     --koboreru ... --koboreru-sha256 ... --yes --stock-boot-ok
 ```
 
-Add `--dry-run` to print every mtkclient and fastboot command instead of
+Add `--dry-run` to print every Amonet and fastboot command instead of
 running it; it writes no host files.  Dry-run still validates the local input
 files and their pinned digests; it prints, rather than checks, the
 device-dependent gates.
@@ -133,8 +138,11 @@ python3 -m unittest -v test_lidar_prepare
 ```
 
 The suite uses an in-memory fake adapter and a fake subprocess runner, so it
-never opens USB or runs mtkclient.  The runner stand-in writes files the way
-mtkclient does, which covers the adapter's partition-relative read logic.
+never opens USB or the network.  Where the sibling Amonet fork and the
+reviewed Lidar readback are present (or `AMONET` and `LIDAR_BACKUP_DIR` point
+at them), the same stages also run through the real adapter against the Amonet
+simulated BROM: identity, area and absolute reads, the backup digests, the
+drill, and the dry-run write set.
 
 ## Files
 
@@ -143,9 +151,10 @@ mtkclient does, which covers the adapter's partition-relative read logic.
 | `lidar_prepare.py` | stages, GPT/geometry checks, chain install, CLI |
 | `lidar_donor_artifacts.py` | donor-derived chain artifacts and digest manifest |
 | `capture_stock_gbls.py` | verified copy of the stock Zigbee GBLs into `local-firmware/` |
-| `mtk_adapter.py` | the one mtkclient seam: identity, area reads, pocket writes |
+| `amonet_adapter.py` | the Amonet seam: identity, area reads, pocket writes |
+| `mtk_adapter.py` | the legacy mtkclient seam, kept until the Amonet cutover completes |
 | `host_io.py` | shared hashing, timestamp and atomic-write helpers |
-| `test_lidar_prepare.py` | host tests with a fake adapter and runner |
+| `test_lidar_prepare.py` | host tests with a fake adapter, the runner and the Amonet simulator |
 | `test_lidar_donor_artifacts.py` | synthetic backup and composition tests |
 | `test_capture_stock_gbls.py` | synthetic rootfs capture tests |
 
