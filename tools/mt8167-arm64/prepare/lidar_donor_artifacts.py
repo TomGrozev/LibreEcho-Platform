@@ -138,6 +138,51 @@ def _artifact_record(name: str, data: bytes, source: str) -> dict:
     }
 
 
+def _read_verified_areas(backup_dir: Path, manifest_path: Path,
+                         preloader_sha256: str) -> tuple[bytes, bytes]:
+    """Return the verified boot0 and stock tee1 bytes without writing anything."""
+    try:
+        files = backup.load_manifest(manifest_path)
+        backup.require_complete_backup(backup_dir, files)
+    except backup.BackupSetError as error:
+        raise Refusal(f"no usable verified backup: {error}") from error
+
+    boot0 = _read_backup_area(backup_dir, files, "boot0")
+    _check_preloader(boot0, preloader_sha256)
+    stock_tee1 = _read_backup_area(backup_dir, files, "tee1")
+    _check_stock_tee1(stock_tee1)
+    return boot0, stock_tee1
+
+
+def _compose_tee1(stock_tee1: bytes, koboreru: bytes,
+                  koboreru_sha256: str) -> tuple[bytes, bytes]:
+    """Return the stock tee1 tail and the composed tee1 stage."""
+    if koboreru is None or not koboreru_sha256:
+        raise Refusal("koboreru and koboreru-sha256 must be supplied together")
+    digest = sha256_bytes(koboreru)
+    if digest != koboreru_sha256:
+        raise Refusal(f"koboreru is {digest}, pinned digest is {koboreru_sha256}")
+    if len(koboreru) < 16 or not koboreru.startswith(MTK_IMAGE_MAGIC):
+        raise Refusal("Koboreru input is not an MTK image")
+    if koboreru[8:8 + len(STOCK_TEE_TYPE)] != STOCK_TEE_TYPE:
+        raise Refusal("Koboreru input is not an MTK ATF/TEE image")
+    if len(koboreru) > len(stock_tee1):
+        raise Refusal("Koboreru image is larger than the tee1 partition")
+    tail = stock_tee1[len(koboreru):]
+    return tail, koboreru + tail
+
+
+def compose_chain(backup_dir: Path | str, manifest_path: Path | str, *,
+                  koboreru: bytes, koboreru_sha256: str,
+                  preloader_sha256: str = REVIEWED_PRELOADER_SHA256
+                  ) -> tuple[bytes, bytes]:
+    """Return (preloader, tee1 stage) without writing a donor artifact."""
+    boot0, stock_tee1 = _read_verified_areas(
+        Path(backup_dir), Path(manifest_path), preloader_sha256)
+    _tail, stage = _compose_tee1(stock_tee1, koboreru, koboreru_sha256)
+    return boot0, stage
+
+
 def generate(backup_dir: Path | str, manifest_path: Path | str,
              out_dir: Path | str, *, koboreru: bytes | None = None,
              koboreru_sha256: str | None = None,
@@ -151,16 +196,8 @@ def generate(backup_dir: Path | str, manifest_path: Path | str,
     out = require_local_output(out_dir)
     backup_dir = Path(backup_dir)
     manifest_path = Path(manifest_path)
-    try:
-        files = backup.load_manifest(manifest_path)
-        backup.require_complete_backup(backup_dir, files)
-    except backup.BackupSetError as error:
-        raise Refusal(f"no usable verified backup: {error}") from error
-
-    boot0 = _read_backup_area(backup_dir, files, "boot0")
-    _check_preloader(boot0, preloader_sha256)
-    stock_tee1 = _read_backup_area(backup_dir, files, "tee1")
-    _check_stock_tee1(stock_tee1)
+    boot0, stock_tee1 = _read_verified_areas(
+        backup_dir, manifest_path, preloader_sha256)
 
     artifacts: list[dict] = []
     payloads: list[tuple[str, bytes, str]] = [
@@ -171,20 +208,10 @@ def generate(backup_dir: Path | str, manifest_path: Path | str,
     if koboreru is not None or koboreru_sha256 is not None:
         if koboreru is None or not koboreru_sha256:
             raise Refusal("koboreru and koboreru-sha256 must be supplied together")
-        digest = sha256_bytes(koboreru)
-        if digest != koboreru_sha256:
-            raise Refusal(
-                f"koboreru is {digest}, pinned digest is {koboreru_sha256}")
-        if len(koboreru) < 16 or not koboreru.startswith(MTK_IMAGE_MAGIC):
-            raise Refusal("Koboreru input is not an MTK image")
-        if koboreru[8:8 + len(STOCK_TEE_TYPE)] != STOCK_TEE_TYPE:
-            raise Refusal("Koboreru input is not an MTK ATF/TEE image")
-        if len(koboreru) > len(stock_tee1):
-            raise Refusal("Koboreru image is larger than the tee1 partition")
-        tail = stock_tee1[len(koboreru):]
+        tail, stage = _compose_tee1(stock_tee1, koboreru, koboreru_sha256)
         payloads.extend([
             ("tee1-stock-tail.bin", tail, "backup:tee1[koboreru-length:]"),
-            ("tee1-stage.bin", koboreru + tail, "backup:tee1+koboreru"),
+            ("tee1-stage.bin", stage, "backup:tee1+koboreru"),
         ])
 
     for name, data, source in payloads:

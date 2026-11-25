@@ -64,12 +64,11 @@ from host_io import (  # noqa: E402
     utc_stamp,
     write_bytes_atomic,
 )
-from amonet_adapter import AmonetClient  # noqa: E402
-from mtk_adapter import (  # noqa: E402
+from amonet_adapter import (  # noqa: E402
     AdapterError,
     AdapterWriteRefused,
+    AmonetClient,
     Identity,
-    MtkClient,
 )
 
 SCHEMA_BACKUP = backup.SCHEMA
@@ -522,11 +521,17 @@ def stage_install(adapter, log: JsonlLog, backup_dir: Path, manifest_path: Path,
     if dry:
         if not manifest_path.is_file():
             print(f"DRY-RUN install: {manifest_path} is produced by the backup stage")
+            tee1_stage = b"\0" * backup.BY_NAME["tee1"].size
+            preloader = b"\0" * backup.BOOT_AREA_BYTES
         else:
-            _load_verified_backup(backup_dir, manifest_path)
+            try:
+                preloader, tee1_stage = donor.compose_chain(
+                    backup_dir, manifest_path, koboreru=koboreru,
+                    koboreru_sha256=koboreru_sha256,
+                    preloader_sha256=REVIEWED_PRELOADER_SHA256)
+            except donor.Refusal as error:
+                raise Refusal(str(error)) from error
         print(f"DRY-RUN install: donor artifacts would be generated under {donor_dir}")
-        tee1_stage = b"\0" * backup.BY_NAME["tee1"].size
-        preloader = b"\0" * backup.BOOT_AREA_BYTES
     else:
         _load_verified_backup(backup_dir, manifest_path)
         try:
@@ -689,12 +694,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "environment variable)")
     parser.add_argument("--amonet-python", type=Path,
                         help="python for the amonet tool (default: this interpreter)")
-    parser.add_argument("--mtkclient", type=Path,
-                        help="mtkclient checkout (legacy; the Amonet adapter is preferred)")
-    parser.add_argument("--mtkclient-python", type=Path,
-                        help="python for mtkclient (default: <checkout>/.venv/bin/python)")
-    parser.add_argument("--workdir", type=Path,
-                        help="mtkclient session directory (default: ./lidar-prepare-work)")
     parser.add_argument("--log", type=Path, help="JSON-lines log path")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every device operation without running it")
@@ -748,19 +747,11 @@ def _default_log(args) -> Path:
 
 def _make_adapter(args):
     amonet_root = args.amonet or os.environ.get("AMONET")
-    if amonet_root:
-        return AmonetClient(amonet_root, python=args.amonet_python,
-                            dry_run=args.dry_run)
-    root = args.mtkclient or os.environ.get("MTKCLIENT")
-    if not root:
+    if not amonet_root:
         raise PrepareError(
-            "no device tool checkout: pass --amonet (or set AMONET), or the "
-            "legacy --mtkclient (or MTKCLIENT)")
-    workdir = args.workdir or (Path(args.session_dir) / "mtk-work"
-                               if getattr(args, "session_dir", None)
-                               else Path("lidar-prepare-work"))
-    return MtkClient(root, python_executable=args.mtkclient_python,
-                     workdir=workdir, dry_run=args.dry_run)
+            "amonet checkout not found: pass --amonet or set AMONET")
+    return AmonetClient(amonet_root, python=args.amonet_python,
+                        dry_run=args.dry_run)
 
 
 def main(argv: list[str] | None = None, *, adapter_factory=None,

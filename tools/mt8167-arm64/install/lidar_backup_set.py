@@ -2,9 +2,9 @@
 """The Lidar (Echo Plus 2nd Gen, MT8167) boot-chain backup set and its verifier.
 
 This module is pure data plus host-side file checks.  It performs no USB,
-fastboot, BROM or mtkclient operation: the reviewed preparation command that
-will read these areas is out of scope, and calls the data and
-``verify_backup_set`` defined here.
+fastboot or BROM operation: the reviewed preparation command that reads these
+areas is out of scope, and calls the data and ``verify_backup_set`` defined
+here.
 
 The set is derived from the lab evidence, not from the reference kit:
 
@@ -46,7 +46,7 @@ SCHEMA = "libreecho-lidar-backup-v1"
 SECTOR_BYTES = 512
 FLASH_BYTES = 0x1C8000000  # 7650410496; brom-printgpt.log:142
 BOOT_AREA_BYTES = 0x200000  # 2 MiB per eMMC boot area
-GPT_PRIMARY_BYTES = 0x16000  # mtkclient 'r gpt' read, phase-01 manifest
+GPT_PRIMARY_BYTES = 0x16000  # primary GPT read, phase-01 manifest
 GPT_BACKUP_OFFSET = 0x1C7FFBE00  # flash_bytes - 0x4200
 GPT_BACKUP_BYTES = 0x4200  # 33 sectors: 32 entry sectors + header
 
@@ -55,9 +55,11 @@ GPT_BACKUP_BYTES = 0x4200  # 33 sectors: 32 entry sectors + header
 class BackupArea:
     """One area to read before any chain write.
 
-    ``kind`` follows mtkclient naming: ``boot1`` is eMMC boot area 1,
-    ``boot2`` is eMMC boot area 2, and ``user`` is a GPT partition.  ``gpt``
-    and ``gpt_backup`` are absolute user-area reads that are not GPT entries.
+    ``kind`` numbers the boot areas as the eMMC spec does: ``boot1`` is Boot
+    Area Partition 1, ``boot2`` is Boot Area Partition 2, and ``user`` is a GPT
+    partition.  ``name`` follows the drill manifest and the Amonet CLI, which
+    call Boot Area Partition 1 ``boot0``.  ``gpt`` and ``gpt_backup`` are
+    absolute user-area reads that are not GPT entries.
     """
 
     name: str

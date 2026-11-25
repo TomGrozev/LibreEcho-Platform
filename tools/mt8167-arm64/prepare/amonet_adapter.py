@@ -3,8 +3,7 @@
 
 Only this module knows how the Lidar preparation command reaches the Amonet
 CLI.  The command logic never spawns a process and never parses the tool's
-output itself; it talks to the same duck-typed interface the mtkclient adapter
-implements.
+output itself; it talks to the duck-typed interface this module defines.
 
 The tool is ``modules/lidar_brom.py`` in the Amonet checkout (``--amonet`` or
 ``AMONET``; there is no built-in default).  Its command set is::
@@ -27,22 +26,38 @@ the caller sees a stable message.
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-# The adapter error and identity names are shared with the mtkclient adapter so
-# the preparation command keeps one catch for every tool.  They move here when
-# the mtkclient adapter is removed.
-from mtk_adapter import AdapterError, AdapterWriteRefused, Identity
+
+class AdapterError(RuntimeError):
+    """The Amonet tool is missing, failed, or produced an unusable result."""
+
+
+class AdapterWriteRefused(RuntimeError):
+    """The request would write an area the adapter never writes."""
+
+
+@dataclass(frozen=True)
+class Identity:
+    """The part of the BROM identity the command gates on."""
+
+    hwcode: int
+    flash_bytes: int
+    boot_area_bytes: int
+    sector_bytes: int = 512
+
 
 DEFAULT_TIMEOUT = 600
 SECTOR_BYTES = 512
 _GPT_KINDS = frozenset({"gpt", "gpt_backup"})
 _BOOT_KINDS = frozenset({"boot1", "boot2"})
-_BOOT_AREA_2_NAMES = frozenset({"boot1", "boot2"})
+_CLI_BOOT_AREA_2_NAMES = frozenset({"boot1", "boot2"})
 
 
 class AmonetClient:
@@ -121,7 +136,8 @@ class AmonetClient:
                     f"short boot-area read from {area.name!r}: wanted "
                     f"{area.offset + area.size} bytes, got {len(data)}")
             return data[area.offset:area.offset + area.size]
-        # A user-area read is partition-relative, like mtkclient's ``r name``.
+        # A user-area read is partition-relative: it starts at the partition's
+        # first sector.
         if len(data) != area.size:
             raise AdapterError(
                 f"read from {area.name!r}: wanted exactly {area.size} bytes, "
@@ -178,13 +194,14 @@ class AmonetClient:
                        area: str | None = None) -> None:
         if not data:
             raise AdapterWriteRefused("refusing an empty write")
-        if area in _BOOT_AREA_2_NAMES:
+        if area in _CLI_BOOT_AREA_2_NAMES:
             raise AdapterWriteRefused("boot area 2 is never writable")
         if len(data) % SECTOR_BYTES:
             raise AdapterWriteRefused(
                 f"{what} write is {len(data)} bytes, not 512-byte aligned")
         if self.dry_run:
-            self._print(cmd, size=len(data))
+            self._print(cmd, size=len(data),
+                        digest=hashlib.sha256(data).hexdigest())
             return
         with tempfile.TemporaryDirectory(prefix="lidar-prepare-") as tmp:
             source = Path(tmp) / "write.bin"
@@ -223,7 +240,10 @@ class AmonetClient:
                 f"amonet command failed (exit {proc.returncode}): {rendered}: {tail}")
         return proc
 
-    def _print(self, cmd: Sequence[str], size: int | None = None) -> None:
+    def _print(self, cmd: Sequence[str], size: int | None = None,
+               digest: str | None = None) -> None:
         rendered = " ".join(cmd)
         suffix = f"  # {size} bytes" if size is not None else ""
+        if digest is not None:
+            suffix += f" sha256:{digest}"
         print(f"DRY-RUN amonet: {rendered}{suffix}")

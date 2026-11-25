@@ -11,7 +11,7 @@ the `expdb` rule.
 
 | Command | Device access | Writes |
 | --- | --- | --- |
-| `identify` | tool `identity`/`printgpt`, GPT and backup GPT reads | none |
+| `identify` | tool `identity`, GPT and backup GPT reads | none |
 | `backup` | reads every `lidar_backup_set.py` area twice | host files only |
 | `drill` | reads, then writes identical bytes to the drill areas | gpt, gpt_backup, expdb, tee1, boot0 body, boot0 sector 0 last |
 | `stock-boot` | none | none; records the operator's confirmation |
@@ -53,11 +53,13 @@ python3 lidar_prepare.py confirm --fastboot fastboot
 `--amonet` names the Amonet checkout; `AMONET` in the environment serves the
 same purpose, and there is no built-in default.  The adapter runs
 `modules/lidar_brom.py` from that checkout with this interpreter unless
-`--amonet-python` names another.  `--mtkclient`/`MTKCLIENT` still selects the
-legacy mtkclient adapter; `--amonet` wins when both are given, and
-`--workdir`/`--mtkclient-python` apply only to it.  With neither tool named
-the command exits 1 and the message names both flags and environment
-variables.
+`--amonet-python` names another.  With neither the flag nor the environment
+variable set, or with a checkout that has no `modules/lidar_brom.py`, the
+command exits 1 and the message names `--amonet` and `AMONET`.
+
+The Amonet checkout is the only device tool.  No MediaTek download agent is
+used: the Amonet payload runs from BROM SRAM and the command talks to the
+Amonet CLI for every read and write.
 
 `run` chains them with one session directory and `--yes`:
 
@@ -138,11 +140,11 @@ python3 -m unittest -v test_lidar_prepare
 ```
 
 The suite uses an in-memory fake adapter and a fake subprocess runner, so it
-never opens USB or the network.  Where the sibling Amonet fork and the
-reviewed Lidar readback are present (or `AMONET` and `LIDAR_BACKUP_DIR` point
-at them), the same stages also run through the real adapter against the Amonet
-simulated BROM: identity, area and absolute reads, the backup digests, the
-drill, and the dry-run write set.
+never opens USB or the network.  The same stages also run through the real
+adapter against the Amonet simulated BROM when the sibling Amonet checkout
+exists (or `AMONET` names it) and `LIDAR_BACKUP_DIR` names the reviewed Lidar
+backup.  The backup path has no default because the reviewed dump is private
+evidence; without `LIDAR_BACKUP_DIR` those cases print a skip reason.
 
 ## Files
 
@@ -151,8 +153,7 @@ drill, and the dry-run write set.
 | `lidar_prepare.py` | stages, GPT/geometry checks, chain install, CLI |
 | `lidar_donor_artifacts.py` | donor-derived chain artifacts and digest manifest |
 | `capture_stock_gbls.py` | verified copy of the stock Zigbee GBLs into `local-firmware/` |
-| `amonet_adapter.py` | the Amonet seam: identity, area reads, pocket writes |
-| `mtk_adapter.py` | the legacy mtkclient seam, kept until the Amonet cutover completes |
+| `amonet_adapter.py` | the Amonet seam and the adapter contract (`AdapterError`, `AdapterWriteRefused`, `Identity`): identity, area reads, pocket writes |
 | `host_io.py` | shared hashing, timestamp and atomic-write helpers |
 | `test_lidar_prepare.py` | host tests with a fake adapter, the runner and the Amonet simulator |
 | `test_lidar_donor_artifacts.py` | synthetic backup and composition tests |

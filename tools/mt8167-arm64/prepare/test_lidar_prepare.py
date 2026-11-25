@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Host-only tests for the Lidar preparation command and its mtkclient adapter.
+"""Host-only tests for the Lidar preparation command and its Amonet adapter.
 
-The command is exercised through ``main`` with an in-memory fake adapter, so no
-test opens USB or runs mtkclient.  The adapter's own command construction is
-checked with a recording runner and a throwaway checkout.
+The command is exercised through ``main`` with an in-memory fake adapter.  No
+test opens USB; the real adapter runs only against the Amonet simulated BROM,
+and those cases skip when the sibling checkout or the reviewed backup is
+absent.  The adapter's own command construction is checked with a recording
+runner and a throwaway checkout.
 """
 from __future__ import annotations
 
@@ -28,16 +30,16 @@ sys.path.insert(0, str(HERE.parent / "install"))
 import amonet_adapter  # noqa: E402
 import lidar_backup_set as backup  # noqa: E402
 import lidar_prepare as prepare  # noqa: E402
-import mtk_adapter  # noqa: E402
 
-# The real adapter runs against the sibling Amonet fork and the reviewed Lidar
-# readback, both outside this checkout.  CI without them skips those cases; the
-# paths can be overridden with AMONET and LIDAR_BACKUP_DIR.
+# The real adapter runs against the sibling Amonet fork and a reviewed Lidar
+# readback.  CI without them skips those cases.  The Amonet checkout may be
+# named by AMONET; the backup directory must be named by LIDAR_BACKUP_DIR
+# because the reviewed dump is private evidence and has no in-tree default.
 PLATFORM_ROOT = HERE.parents[2]
 AMONET_CHECKOUT = Path(os.environ.get("AMONET")
                        or PLATFORM_ROOT.parent / "amonet")
-LIDAR_SIM = Path(os.environ.get("LIDAR_BACKUP_DIR")
-                 or PLATFORM_ROOT.parents[1] / "dumps" / "20261110-lidar-readback")
+LIDAR_BACKUP_DIR = os.environ.get("LIDAR_BACKUP_DIR")
+LIDAR_SIM = Path(LIDAR_BACKUP_DIR) if LIDAR_BACKUP_DIR else None
 REVIEWED_DIGESTS = {
     "boot0": "d5fc0bbbc89b7dfaa7ca39fc1d0bc8da0df4a66e2324f3a9742ba70c04f5e327",
     "boot1": "4c8e02060ab820652000e4ffae90c5554d88230625edc704d269bee3efeb80f3",
@@ -48,11 +50,19 @@ REVIEWED_DIGESTS = {
 }
 
 
+def _skip(reason: str) -> None:
+    print(f"SKIP: {reason}", file=sys.stderr)
+    raise unittest.SkipTest(reason)
+
+
 def require_simulator() -> None:
     if not (AMONET_CHECKOUT / "modules" / "lidar_brom.py").is_file():
-        raise unittest.SkipTest(f"amonet checkout not present at {AMONET_CHECKOUT}")
+        _skip(f"amonet checkout not present at {AMONET_CHECKOUT}")
+    if LIDAR_SIM is None:
+        _skip("LIDAR_BACKUP_DIR is not set; name the reviewed Lidar backup to "
+              "run the real-adapter simulator cases")
     if not LIDAR_SIM.is_dir():
-        raise unittest.SkipTest(f"reviewed Lidar backup not present at {LIDAR_SIM}")
+        _skip(f"reviewed Lidar backup not present at {LIDAR_SIM}")
 
 
 # Live GPT offsets (lab-notes/phase-01/brom-printgpt.log:123-142, in the
@@ -109,14 +119,14 @@ def deterministic(name: str, size: int, prefix: bytes = b"") -> bytes:
                          for index in range(size)))[:size].ljust(size, b"\0")
 
 
-class FakeMtk:
+class FakeDevice:
     """In-memory device with the fake-adapter seam the command uses."""
 
     dry_run = False
 
     def __init__(self, *, hwcode: int = 0x8167, flash_bytes: int = backup.FLASH_BYTES,
                  boot_area_bytes: int = backup.BOOT_AREA_BYTES, gpt=None):
-        self.identity_value = mtk_adapter.Identity(
+        self.identity_value = amonet_adapter.Identity(
             hwcode, flash_bytes, boot_area_bytes, 512)
         self.areas = {
             "boot0": bytearray(deterministic("boot0", backup.BOOT_AREA_BYTES,
@@ -179,18 +189,21 @@ class FakeMtk:
 
     def write_absolute(self, offset: int, data: bytes):
         area, relative = self._absolute(offset)
-        self.writes.append(("absolute", area.name, offset, len(data)))
+        self.writes.append(("absolute", area.name, offset, len(data),
+                            hashlib.sha256(data).hexdigest()))
         target = self.areas[area.name]
         target[relative:relative + len(data)] = data
         if area.name == "expdb" and self.bad_expdb_after_write:
             self._expdb_reads_pending = 2
 
     def write_partition(self, name: str, data: bytes):
-        self.writes.append(("partition", name, 0, len(data)))
+        self.writes.append(("partition", name, 0, len(data),
+                            hashlib.sha256(data).hexdigest()))
         self.areas[name] = bytearray(data)
 
     def write_boot_area1(self, offset: int, data: bytes):
-        self.writes.append(("boot1", "boot0", offset, len(data)))
+        self.writes.append(("boot1", "boot0", offset, len(data),
+                            hashlib.sha256(data).hexdigest()))
         self.areas["boot0"][offset:offset + len(data)] = data
 
 
@@ -244,7 +257,7 @@ class CommandCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.fake = FakeMtk()
+        self.fake = FakeDevice()
         self.inputs = chain_inputs(self.root / "inputs")
         self.log = self.root / "log.jsonl"
         # The fake device's boot0 stands for the reviewed 2019 preloader; the
@@ -259,10 +272,9 @@ class CommandCase(unittest.TestCase):
         return self.fake
 
     def checkout(self):
-        checkout = self.root / "mtkclient"
-        (checkout / ".venv" / "bin").mkdir(parents=True)
-        (checkout / "mtk.py").write_text("")
-        (checkout / ".venv" / "bin" / "python").symlink_to(sys.executable)
+        checkout = self.root / "amonet"
+        (checkout / "modules").mkdir(parents=True)
+        (checkout / "modules" / "lidar_brom.py").write_text("")
         return checkout
 
     def base(self, command, *extra):
@@ -304,6 +316,18 @@ class CommandCase(unittest.TestCase):
             "--koboreru-sha256", sha(Path(self.inputs["koboreru"])),
             "--yes", *extra)
 
+    def run_args(self, session, *extra):
+        return ["--log", str(self.log), "run", "--session-dir", str(session),
+                "--kaeru", self.inputs["kaeru"],
+                "--kaeru-sha256", sha(Path(self.inputs["kaeru"])),
+                "--koboreru", self.inputs["koboreru"],
+                "--koboreru-sha256", sha(Path(self.inputs["koboreru"])),
+                "--yes", "--stock-boot-ok", *extra]
+
+    def fastboot(self, product="LIDAR", code=0):
+        return lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, code, f"product: {product}\n", "")
+
     def _move_misc_entry(self, data: bytes, base: int) -> bytes:
         changed = bytearray(data)
         struct.pack_into("<Q", changed, base + 7 * 128 + 32,
@@ -331,7 +355,7 @@ class IdentifyTests(CommandCase):
         self.assertEqual(ok[-1]["hwcode"], "0x8167")
 
     def test_wrong_hwcode_refuses(self):
-        self.fake.identity_value = mtk_adapter.Identity(
+        self.fake.identity_value = amonet_adapter.Identity(
             0x8163, backup.FLASH_BYTES, backup.BOOT_AREA_BYTES, 512)
         code, _out, err = quiet_main(self.base("identify"), adapter_factory=self.factory)
         self.assertEqual(code, 2)
@@ -362,7 +386,7 @@ class IdentifyTests(CommandCase):
         self.assertIn("backup GPT entries differ", err)
 
     def test_wrong_flash_geometry_refuses(self):
-        self.fake.identity_value = mtk_adapter.Identity(
+        self.fake.identity_value = amonet_adapter.Identity(
             0x8167, backup.FLASH_BYTES + 512, backup.BOOT_AREA_BYTES, 512)
         code, _out, err = quiet_main(self.base("identify"), adapter_factory=self.factory)
         self.assertEqual(code, 2)
@@ -442,7 +466,7 @@ class DrillTests(CommandCase):
 
     def test_drill_rechecks_identity_before_writing(self):
         directory = self.backup()
-        self.fake.identity_value = mtk_adapter.Identity(
+        self.fake.identity_value = amonet_adapter.Identity(
             0x8163, backup.FLASH_BYTES, backup.BOOT_AREA_BYTES, 512)
         code, _out, err = self.drill(directory, self.root / "drill.json")
         self.assertEqual(code, 2)
@@ -450,7 +474,7 @@ class DrillTests(CommandCase):
         self.assertEqual(self.fake.writes, [])
 
     def test_dry_run_prints_the_same_expdb_write_as_the_real_loop(self):
-        adapter = mtk_adapter.MtkClient(
+        adapter = amonet_adapter.AmonetClient(
             self.checkout(),
             runner=lambda *args, **kwargs: self.fail("dry run executed a command"),
             dry_run=True)
@@ -462,9 +486,10 @@ class DrillTests(CommandCase):
                 self.root / "backup" / "backup-manifest.json",
                 self.root / "drill.json")
         printed = out.getvalue()
-        self.assertIn("wo 0xf00000 0xa00000", printed)
-        self.assertIn("w tee1", printed)
-        self.assertNotIn("w expdb", printed)
+        self.assertIn("write --offset 0xf00000 --input", printed)
+        self.assertIn(f"# {backup.BY_NAME['expdb'].size} bytes", printed)
+        self.assertIn("write --area tee1 --input", printed)
+        self.assertNotIn("write --area expdb", printed)
 
 
 class InstallTests(CommandCase):
@@ -634,18 +659,6 @@ class InstallTests(CommandCase):
 
 
 class RunTests(CommandCase):
-    def run_args(self, session, *extra):
-        return ["--log", str(self.log), "run", "--session-dir", str(session),
-                "--kaeru", self.inputs["kaeru"],
-                "--kaeru-sha256", sha(Path(self.inputs["kaeru"])),
-                "--koboreru", self.inputs["koboreru"],
-                "--koboreru-sha256", sha(Path(self.inputs["koboreru"])),
-                "--yes", "--stock-boot-ok", *extra]
-
-    def fastboot(self, product="LIDAR", code=0):
-        return lambda cmd, **kwargs: subprocess.CompletedProcess(
-            cmd, code, f"product: {product}\n", "")
-
     def test_full_run_succeeds_in_order(self):
         session = self.root / "session"
         code, out, err = quiet_main(
@@ -686,138 +699,44 @@ class RunTests(CommandCase):
                              for write in self.fake.writes))
 
     def test_dry_run_prints_every_device_step_and_writes_nothing(self):
-        checkout = self.root / "mtkclient"
-        (checkout / ".venv" / "bin").mkdir(parents=True)
-        (checkout / "mtk.py").write_text("")
-        (checkout / ".venv" / "bin" / "python").symlink_to(sys.executable)
+        checkout = self.checkout()
         session = self.root / "dry-session"
         args = self.run_args(session)
         args.insert(0, str(checkout))
-        args.insert(0, "--mtkclient")
+        args.insert(0, "--amonet")
         args.insert(args.index("run"), "--dry-run")
         code, out, err = quiet_main(args, fastboot_runner=self.fastboot())
         self.assertEqual(code, 0, err)
-        self.assertIn("DRY-RUN mtkclient: ", out)
+        self.assertIn("DRY-RUN amonet: ", out)
         self.assertIn("DRY-RUN install: ", out)
         self.assertIn("DRY-RUN fastboot: fastboot getvar product", out)
         self.assertFalse((session / "backup").exists())
         self.assertEqual(self.fake.writes, [])
 
 
-class AdapterTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        (self.root / ".venv" / "bin").mkdir(parents=True)
-        (self.root / ".venv" / "bin" / "python").symlink_to(sys.executable)
-        (self.root / "mtk.py").write_text("")
-
-    def test_identity_parses_printgpt(self):
-        def runner(cmd, **kwargs):
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                "Preloader - HW code:\t\t\t0x8167\n"
-                "DAXFlash - EMMC Boot1 Size: 0x200000\n"
-                "DAXFlash - EMMC USER Size:  0x1c8000000\n", "")
-        adapter = mtk_adapter.MtkClient(self.root, runner=runner)
-        self.assertEqual(adapter.identity(),
-                         mtk_adapter.Identity(0x8167, 7650410496, 0x200000, 512))
-
-    def test_partition_read_is_partition_relative(self):
-        """mtkclient writes a whole partition; no absolute-offset slicing."""
-        sizes = {area.name: area.size for area in backup.BACKUP_SET}
-
-        def fill(size: int, seed: int) -> bytes:
-            return bytes((index * 17 + seed) & 0xFF for index in range(size))
-
-        def runner(cmd, **kwargs):
-            target = next(Path(part) for part in cmd if part.endswith("read.bin"))
-            name = cmd[3]
-            target.write_bytes(fill(sizes[name], len(name)))
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        adapter = mtk_adapter.MtkClient(self.root, runner=runner)
-        for name in ("lk_a", "boot0"):
-            self.assertEqual(adapter.read_area(backup.BY_NAME[name]),
-                             fill(sizes[name], len(name)))
-
-    def test_short_partition_read_is_refused(self):
-        def runner(cmd, **kwargs):
-            target = next(Path(part) for part in cmd if part.endswith("read.bin"))
-            target.write_bytes(b"\0" * (backup.BY_NAME["lk_a"].size - 512))
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        adapter = mtk_adapter.MtkClient(self.root, runner=runner)
-        with self.assertRaises(mtk_adapter.AdapterError):
-            adapter.read_area(backup.BY_NAME["lk_a"])
-
-    def test_commands_use_the_grounded_mtkclient_syntax(self):
-        commands = []
-
-        def runner(cmd, **kwargs):
-            commands.append(cmd)
-            target = next(Path(part) for part in cmd
-                          if part.endswith(("read.bin", "write.bin")))
-            size = int(cmd[4], 16) if cmd[2] in ("ro", "wo") else 0x200000
-            target.write_bytes(b"\0" * size)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        adapter = mtk_adapter.MtkClient(self.root, runner=runner)
-        adapter.read_area(backup.BY_NAME["boot0"])
-        adapter.read_area(backup.BY_NAME["gpt_backup"])
-        adapter.write_partition("tee1", b"\0" * 512)
-        adapter.write_boot_area1(0x200, b"\0" * 512)
-        rendered = [
-            " ".join(
-                "<file>" if str(part).endswith(("read.bin", "write.bin"))
-                else Path(part).name if i == 0 else part
-                for i, part in enumerate(cmd))
-            for cmd in commands]
-        self.assertTrue(rendered[0].endswith("r boot0 <file> --parttype boot1"))
-        self.assertIn("ro 0x1c7ffbe00 0x4200", rendered[1])
-        self.assertTrue(rendered[2].endswith("w tee1 <file>"))
-        self.assertTrue(rendered[3].endswith(
-            "wo 0x200 0x200 <file> --parttype boot1"))
-
-    def test_boot_area_2_is_never_writable(self):
-        adapter = mtk_adapter.MtkClient(self.root, runner=lambda *a, **k: None)
-        with self.assertRaises(mtk_adapter.AdapterWriteRefused):
-            adapter._write_command(
-                ["python", "mtk.py", "wo", "0x0", "0x200", "<file>",
-                 "--parttype", "boot2"], b"\0" * 512, "boot area 2")
-
-    def test_dry_run_never_runs_the_runner(self):
-        def runner(cmd, **kwargs):
-            raise AssertionError("dry run executed a command")
-
-        adapter = mtk_adapter.MtkClient(self.root, runner=runner, dry_run=True)
-        self.assertIsNone(adapter.identity())
-        self.assertIsNone(adapter.read_area(backup.BY_NAME["expdb"]))
-        adapter.write_absolute(backup.BY_NAME["expdb"].offset, b"\0" * 512)
-
-
-def printed_amonet_writes(output: str) -> list[tuple[str, str, int, int]]:
+def printed_amonet_writes(output: str) -> list[tuple[str, str, int, int, str]]:
     """Normalise the dry-run write commands to the fake adapter's tuples."""
     writes = []
     for line in output.splitlines():
-        if not line.startswith("DRY-RUN amonet: ") or " write " not in line:
+        if (not line.startswith("DRY-RUN amonet: ") or " write " not in line
+                or "sha256:" not in line):
             continue
         length = int(line.rsplit("#", 1)[1].split()[0])
+        digest = line.rsplit("sha256:", 1)[1].strip()
         tokens = line.split()
         rest = tokens[tokens.index("write") + 1:]
         area = rest[rest.index("--area") + 1] if "--area" in rest else None
         offset = (int(rest[rest.index("--offset") + 1], 16)
                   if "--offset" in rest else 0)
         if area == "boot0":
-            writes.append(("boot1", "boot0", offset, length))
+            writes.append(("boot1", "boot0", offset, length, digest))
         elif area is not None:
-            writes.append(("partition", area, offset, length))
+            writes.append(("partition", area, offset, length, digest))
         else:
             name = next(item.name for item in backup.BACKUP_SET
                         if item.offset == offset
                         and item.kind in ("user", "gpt", "gpt_backup"))
-            writes.append(("absolute", name, offset, length))
+            writes.append(("absolute", name, offset, length, digest))
     return writes
 
 
@@ -907,17 +826,57 @@ class AmonetAdapterCommandTests(unittest.TestCase):
         adapter = amonet_adapter.AmonetClient(self.root, runner=runner)
         adapter.read_area(backup.BY_NAME["boot0"])
         adapter.read_area(backup.BY_NAME["gpt"])
+        adapter.write_absolute(0xF00000, b"\0" * 512)
         adapter.write_partition("tee1", b"\0" * 512)
         adapter.write_boot_area1(0x200, b"\0" * 512)
         rendered = [" ".join(cmd) for cmd in recorded]
         self.assertIn("read --area boot0 --output", rendered[0])
         self.assertIn("read --offset 0x0 --length 0x16000", rendered[1])
-        self.assertIn("write --area tee1 --input", rendered[2])
+        self.assertIn("write --offset 0xf00000 --input", rendered[2])
         self.assertTrue(rendered[2].endswith("--approve-write"))
-        self.assertIn("write --area boot0 --offset 0x200", rendered[3])
+        self.assertIn("write --area tee1 --input", rendered[3])
         self.assertTrue(rendered[3].endswith("--approve-write"))
+        self.assertIn("write --area boot0 --offset 0x200", rendered[4])
+        self.assertTrue(rendered[4].endswith("--approve-write"))
 
-    def test_refusals_match_the_mtk_adapter(self):
+    def test_a_user_area_read_is_partition_relative(self):
+        size = backup.BY_NAME["tee1"].size
+        payload = bytes((index * 17 + 3) & 0xFF for index in range(size))
+
+        def runner(cmd, **kwargs):
+            target = next(Path(part) for part in cmd if part.endswith("read.bin"))
+            target.write_bytes(payload)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        adapter = amonet_adapter.AmonetClient(self.root, runner=runner)
+        self.assertEqual(adapter.read_area(backup.BY_NAME["tee1"]), payload)
+
+    def test_short_area_and_absolute_reads_are_refused(self):
+        def short(cmd, **kwargs):
+            target = next(Path(part) for part in cmd if part.endswith("read.bin"))
+            target.write_bytes(b"\0" * (backup.BY_NAME["tee1"].size - 512))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        adapter = amonet_adapter.AmonetClient(self.root, runner=short)
+        with self.assertRaises(amonet_adapter.AdapterError):
+            adapter.read_area(backup.BY_NAME["tee1"])
+        with self.assertRaises(amonet_adapter.AdapterError):
+            adapter.read_absolute(0, 0x4200)
+
+    def test_dry_run_never_runs_the_runner(self):
+        def runner(cmd, **kwargs):
+            raise AssertionError("dry run executed a command")
+
+        adapter = amonet_adapter.AmonetClient(
+            self.root, runner=runner, dry_run=True)
+        self.assertIsNone(adapter.identity())
+        self.assertIsNone(adapter.read_area(backup.BY_NAME["expdb"]))
+        self.assertIsNone(adapter.read_absolute(0, 512))
+        adapter.write_absolute(backup.BY_NAME["expdb"].offset, b"\0" * 512)
+        adapter.write_partition("tee1", b"\0" * 512)
+        adapter.write_boot_area1(0, b"\0" * 512)
+
+    def test_write_refusals_never_run_the_tool(self):
         adapter = amonet_adapter.AmonetClient(
             self.root, runner=lambda *args, **kwargs: self.fail("refusal ran the tool"))
         with self.assertRaisesRegex(amonet_adapter.AdapterWriteRefused,
@@ -986,18 +945,6 @@ class AmonetCommandTests(CommandCase):
         self.assertEqual(code, 0, err)
         return directory, drill, stock
 
-    def run_args(self, session):
-        return ["--log", str(self.log), "run", "--session-dir", str(session),
-                "--kaeru", self.inputs["kaeru"],
-                "--kaeru-sha256", sha(Path(self.inputs["kaeru"])),
-                "--koboreru", self.inputs["koboreru"],
-                "--koboreru-sha256", sha(Path(self.inputs["koboreru"])),
-                "--yes", "--stock-boot-ok"]
-
-    def fastboot(self):
-        return lambda cmd, **kwargs: subprocess.CompletedProcess(
-            cmd, 0, "product: LIDAR\n", "")
-
     def test_identify_over_the_simulated_brom(self):
         code, _out, err = self.run_with(self.amonet(), "identify")
         self.assertEqual(code, 0, err)
@@ -1033,7 +980,9 @@ class AmonetCommandTests(CommandCase):
         code, out, err = quiet_main(
             args, adapter_factory=lambda _args: self.amonet(dry_run=True))
         self.assertEqual(code, 0, err)
-        self.assertEqual(printed_amonet_writes(out), expected)
+        planned = printed_amonet_writes(out)
+        self.assertEqual(planned, expected)
+        self.assertTrue(all(len(write[4]) == 64 for write in planned))
 
     def test_run_dry_run_prints_the_fake_adapter_write_set(self):
         code, _out, err = quiet_main(
@@ -1050,19 +999,27 @@ class AmonetCommandTests(CommandCase):
             args, adapter_factory=lambda _args: self.amonet(dry_run=True),
             fastboot_runner=self.fastboot())
         self.assertEqual(code, 0, err)
-        self.assertEqual(printed_amonet_writes(out), expected)
+        planned = printed_amonet_writes(out)
+        # A run dry-run writes no backup, so its donor-derived bytes cannot
+        # equal the fake run's; the area, offset and length identify the same
+        # writes, and every line carries a digest.  Full digest equality is
+        # asserted by the install planning test, where the backup exists.
+        self.assertEqual([write[:4] for write in planned],
+                         [write[:4] for write in expected])
+        self.assertTrue(all(len(write[4]) == 64 for write in planned))
+        self.assertTrue(any(write[:2] == ("absolute", "expdb")
+                            for write in planned))
         self.assertIn("DRY-RUN amonet: ", out)
         self.assertFalse((session / "backup").exists())
 
 
 class AmonetSelectionTests(CommandCase):
-    def test_no_tool_named_refuses_and_names_both_flags(self):
+    def test_no_tool_named_refuses_and_names_the_flag(self):
         with mock.patch.dict(os.environ):
             os.environ.pop("AMONET", None)
-            os.environ.pop("MTKCLIENT", None)
             code, _out, err = quiet_main(self.base("identify"))
         self.assertEqual(code, 1)
-        for token in ("--amonet", "AMONET", "--mtkclient", "MTKCLIENT"):
+        for token in ("--amonet", "AMONET"):
             self.assertIn(token, err)
 
     def test_a_named_path_without_the_tool_refuses_with_the_same_code(self):
@@ -1081,17 +1038,6 @@ class AmonetSelectionTests(CommandCase):
             code, _out, err = quiet_main(self.base("identify"))
         self.assertEqual(code, 1)
         self.assertIn("--amonet", err)
-
-    def test_amonet_wins_over_the_legacy_mtkclient_flag(self):
-        require_simulator()
-        args = ["--log", str(self.log),
-                "--amonet", str(AMONET_CHECKOUT),
-                "--mtkclient", str(self.root / "absent"),
-                "--dry-run", "identify"]
-        code, out, err = quiet_main(args)
-        self.assertEqual(code, 0, err)
-        self.assertIn("DRY-RUN amonet: ", out)
-        self.assertNotIn("DRY-RUN mtkclient: ", out)
 
 
 if __name__ == "__main__":

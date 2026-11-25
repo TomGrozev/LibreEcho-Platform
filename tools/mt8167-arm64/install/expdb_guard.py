@@ -9,8 +9,8 @@ already broken, and writing flash from that state is forbidden.
 
 Both callers read the partition their own way -- the fastboot installer issues a
 bounded ``fetch:expdb:0:16`` and the BROM preparation command reads the same
-extent through mtkclient -- and pass the bytes here.  This module owns the one
-decision, so a new caller cannot invent a weaker test.
+extent through the Amonet tool -- and pass the bytes here.  This module owns the
+one decision, so a new caller cannot invent a weaker test.
 """
 
 EXPDB_PREFIX_BYTES = 16
