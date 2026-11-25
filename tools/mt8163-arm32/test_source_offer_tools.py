@@ -27,7 +27,7 @@ class SourceOfferTests(unittest.TestCase):
             outputs = []
             manifests = []
             for host_path, output_name in (
-                ("home/andy/workspace/onnxruntime-src", "home.tar.gz"),
+                ("home/builder/workspace/onnxruntime-src", "home.tar.gz"),
                 ("srv/runner/_work/onnxruntime-src", "runner.tar.gz"),
             ):
                 object_file = root / host_path / "core" / "kernel.cc.o"
