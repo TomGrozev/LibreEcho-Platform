@@ -71,7 +71,7 @@ WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
 WPA_CONFIG_PATH = "tools/mt8163-arm32/wpa-supplicant/wpa_supplicant-2.10.config"
-WPA_CONFIG_SHA256 = "6125cc857687fcd464531dcce09194f4b10add0eceec489ae58b6d35c8885f2c"
+WPA_CONFIG_SHA256 = "a1b9aebbe33d0dcd51cbda51d69f9fa2945a0e5ee18ba5e4aa495a28325e0bb6"
 LIBNL_SOURCE_SHA256 = "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d"
 LIBNL_SOURCE_URL = (
     "https://github.com/thom311/libnl/releases/download/"

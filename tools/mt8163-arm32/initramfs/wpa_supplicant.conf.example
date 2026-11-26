@@ -7,4 +7,5 @@ network={
     ssid="CHANGE_ME"
     psk="CHANGE_ME"
     key_mgmt=WPA-PSK
+    bgscan="simple:30:-65:300"
 }

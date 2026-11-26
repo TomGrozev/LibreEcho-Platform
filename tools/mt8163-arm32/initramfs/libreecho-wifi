@@ -8,8 +8,33 @@ PID=/tmp/wpa_supplicant.${IFACE}.pid
 LOG=/tmp/wpa_supplicant.${IFACE}.log
 DHCP_PID=/tmp/udhcpc.${IFACE}.pid
 DHCP_LOG=/tmp/udhcpc.${IFACE}.log
+# Roam away from a weak AP: scan every 30s, leave below -65 dBm, and retry
+# every 300s while no better BSS is in range.
+BGSCAN='simple:30:-65:300'
 
 log() { printf 'libreecho-wifi: %s\n' "$*" >> /tmp/wifi.log; }
+
+# Profiles written before bgscan was compiled in (or before this line was
+# added to the generator) have no roaming parameter, so the client sticks to a
+# weak AP.  Add it to every client network block once, atomically.  A profile
+# that already has any bgscan line is left untouched.
+ensure_bgscan() {
+    [ -r "$CONF" ] || return 0
+    $BB grep -q '^[[:space:]]*bgscan[[:space:]]*=' "$CONF" && return 0
+    tmp="$CONF.bgscan.$$"
+    if $BB awk -v line="    bgscan=\"$BGSCAN\"" '
+        { print }
+        /^[[:space:]]*network[[:space:]]*=[[:space:]]*\{/ { print line }
+    ' "$CONF" > "$tmp" 2>/dev/null &&
+       [ -s "$tmp" ] &&
+       $BB chmod 0600 "$tmp" &&
+       $BB mv "$tmp" "$CONF"; then
+        log bgscan-added
+    else
+        $BB rm -f "$tmp"
+        log bgscan-add-failed
+    fi
+}
 
 status() {
     [ -e "/sys/class/net/$IFACE" ] || { echo absent; return 1; }
@@ -28,6 +53,7 @@ stop() {
 
 start() {
     [ -r "$CONF" ] || { log "config-missing:$CONF"; return 2; }
+    ensure_bgscan
     [ -x "$WPA" ] || { log supplicant-missing; return 3; }
     [ -e "/sys/class/net/$IFACE" ] || { log "interface-missing:$IFACE"; return 4; }
     stop
