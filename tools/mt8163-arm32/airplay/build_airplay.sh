@@ -215,35 +215,37 @@ PY
 }
 
 make_ffmpeg_pkgconfig() {
+    # -L/-l form, not an absolute archive path: ld resolves a bare /usr/lib
+    # archive against the host root, never the sysroot, so an absolute member
+    # only links when the sysroot is /.
     local pc="$work/ffmpeg-pkgconfig"
-    local lib="$SYSROOT/usr/lib/arm-linux-gnueabihf"
     mkdir -p "$pc"
     cat > "$pc/libavutil.pc" <<EOF
 Name: libavutil
 Description: LibreEcho minimal libavutil
 Version: 58
-Libs: /usr/lib/arm-linux-gnueabihf/libavutil.a -lm -lz
+Libs: -L/usr/lib/arm-linux-gnueabihf -lavutil -lm -lz
 Cflags: -I/usr/include
 EOF
     cat > "$pc/libavcodec.pc" <<EOF
 Name: libavcodec
 Description: LibreEcho minimal libavcodec
 Version: 60
-Libs: /usr/lib/arm-linux-gnueabihf/libavcodec.a
+Libs: -L/usr/lib/arm-linux-gnueabihf -lavcodec
 Cflags: -I/usr/include
 EOF
     cat > "$pc/libavformat.pc" <<EOF
 Name: libavformat
 Description: LibreEcho minimal libavformat
 Version: 60
-Libs: /usr/lib/arm-linux-gnueabihf/libavformat.a
+Libs: -L/usr/lib/arm-linux-gnueabihf -lavformat
 Cflags: -I/usr/include
 EOF
     cat > "$pc/libswresample.pc" <<EOF
 Name: libswresample
 Description: LibreEcho minimal libswresample
 Version: 4
-Libs: /usr/lib/arm-linux-gnueabihf/libswresample.a
+Libs: -L/usr/lib/arm-linux-gnueabihf -lswresample
 Cflags: -I/usr/include
 EOF
     export PKG_CONFIG_PATH="$pc:$SYSROOT/usr/lib/arm-linux-gnueabihf/pkgconfig:$SYSROOT/usr/share/pkgconfig"
@@ -282,11 +284,15 @@ build_audio_components() {
         bridge_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
     bridge_cflags+=" -I$SYSROOT/usr/include/arm-linux-gnueabihf -I$SYSROOT/usr/include"
+    # The link needs the sysroot's own library dir named: a cross driver also
+    # searches its own lib dir, which holds the toolchain's libc.so script
+    # with absolute paths that do not resolve under this sysroot.
+    local bridge_ldflags="--sysroot=$SYSROOT -L$SYSROOT/usr/lib/arm-linux-gnueabihf -Wl,-rpath-link,$SYSROOT/usr/lib/arm-linux-gnueabihf"
     mkdir -p "$OUTPUT" "$objects"
     "$CC" $bridge_cflags -c "$AIRPLAY_AUDIO_SOURCE" \
         -o "$objects/airplay_audio.o"
     "$CC" $bridge_cflags "$objects/airplay_audio.o" -lm \
-        -o "$OUTPUT/libreecho-airplay-audio"
+        $bridge_ldflags -o "$OUTPUT/libreecho-airplay-audio"
     "$CC" $bridge_cflags -c "$AUDIO_ENGINE_SOURCE" \
         -o "$objects/audio_engine.o"
     "$CC" $bridge_cflags -c "$AUDIO_SINK_SOURCE" \
@@ -303,7 +309,7 @@ build_audio_components() {
         "$objects/audio_sink.o" "$objects/audio_timing.o" \
         "$objects/audio_visualizer.o" "$objects/playback_status.o" \
         "$objects/aec_reference.o" "$tinyalsa_source/src/libtinyalsa.a" \
-        -ldl -lm -o "$OUTPUT/libreecho-audio-engine"
+        -ldl -lm $bridge_ldflags -o "$OUTPUT/libreecho-audio-engine"
 }
 
 build_shairport() {

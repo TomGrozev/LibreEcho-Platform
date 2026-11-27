@@ -79,6 +79,27 @@ def check_static_wiring() -> None:
         for obj in ("audio_sink.o", "audio_timing.o"):
             if f"objects/{obj}" not in link:
                 problems.append(f"{obj} missing from the engine link command")
+    # Every bridge link must name the sysroot's library dir: without it a cross
+    # driver finds its own libc.so script first, whose absolute paths do not
+    # resolve under this sysroot.
+    if "local bridge_ldflags=\"--sysroot=$SYSROOT " \
+            "-L$SYSROOT/usr/lib/arm-linux-gnueabihf" not in body:
+        problems.append("bridge_ldflags does not name the sysroot library dir")
+    commands, pending = [], ""
+    for line in lines:
+        stripped = line.strip()
+        pending += stripped.removesuffix("\\").strip() + " "
+        if not stripped.endswith("\\"):
+            commands.append(pending)
+            pending = ""
+    links = [command for command in commands
+             if '"$CC" $bridge_cflags' in command and " -c " not in command]
+    if len(links) != 2:
+        problems.append(f"expected 2 bridge link commands, found {len(links)}")
+    for command in links:
+        if "$bridge_ldflags" not in command:
+            problems.append("bridge link does not pass the sysroot library dir: "
+                            + command[:120])
     for name in ("test_audio_sink.py", "test_audio_timing.py",
                  "test_audio_engine_sendspin.py"):
         if f'python3 "$SCRIPT_DIR/{name}"' not in text:
