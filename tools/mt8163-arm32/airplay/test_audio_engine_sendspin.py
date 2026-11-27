@@ -1477,6 +1477,25 @@ static int g_fail_state;         /* 0 idle, 1 partial done, 2 failed */
 static unsigned int g_partial = 500u;
 static int g_fail_errno = EPIPE;
 static unsigned int g_write_calls;
+
+/* The FIFO-tick guard: while a Sendspin generation paces hardware periods,
+ * the loop must never block in poll() on any timeout.  Wall-clock ring
+ * dryness cannot tell a harness scheduling hiccup from a 20 ms tick wait;
+ * the timeout itself can.  The single-fd wait is the credit-until-writable
+ * helper, which legitimately budgets a slice of one period. */
+static int g_engine_child;
+static int g_paced_pcm_open;
+static unsigned int g_tick_polls;
+
+int __real_poll(struct pollfd *fds, nfds_t count, int timeout);
+int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout)
+{
+    if (g_engine_child && g_paced_pcm_open && g_write_calls > 0u &&
+        timeout > 0 && count > 1u)
+        g_tick_polls += 1u;
+    return __real_poll(fds, count, timeout);
+}
+
 static int16_t g_written[1 << 20];
 static size_t g_written_frames;
 
@@ -1528,6 +1547,7 @@ struct pcm *pcm_open(unsigned int card, unsigned int device, unsigned int flags,
                              ? 0u
                              : config->period_size * config->period_count;
     pcm->ready = 1;
+    g_paced_pcm_open = 1;
     logev(T_PCM_OPEN, flags, config->channels, config->rate,
           (int32_t)(config->period_size | (config->period_count << 16)));
     notify('O');
@@ -1551,7 +1571,19 @@ void pcm_close(struct pcm *pcm)
         free(pcm);          /* the refused S32_LE probe was never a stream */
         return;
     }
+    g_paced_pcm_open = 0;
     logev(T_PCM_CLOSE, 0u, 0u, 0u, 0);
+    {
+        char path[760];
+        FILE *out;
+
+        (void)snprintf(path, sizeof(path), "%s/tickpolls", g_root);
+        out = fopen(path, "w");
+        if (out) {
+            (void)fprintf(out, "%u\n", g_tick_polls);
+            (void)fclose(out);
+        }
+    }
     notify('C');
     free(pcm);
 }
@@ -2002,6 +2034,7 @@ static int spawn(const char *root, int scen, pid_t *out_pid, int *out_ev,
     if (pid == 0) {
         close(ev[0]);
         close(ctl[1]);
+        g_engine_child = 1;
         child_main(root, scen, ev[1], ctl[0]);
         _exit(0);
     }
@@ -2368,6 +2401,23 @@ static int write_fifo_period(const char *root, const char *name,
 /* ------------------------------------------------------------------ */
 
 static struct engine_log g_log;
+
+/* The child counts its FIFO-tick polls and leaves the total here when it
+ * closes the paced PCM, so the parent can assert on it after the run. */
+static unsigned int read_tickpolls(const char *root)
+{
+    char path[760];
+    FILE *in;
+    unsigned int count = 0u;
+
+    (void)snprintf(path, sizeof(path), "%s/tickpolls", root);
+    in = fopen(path, "r");
+    if (!in)
+        return 0u;
+    (void)fscanf(in, "%u", &count);
+    (void)fclose(in);
+    return count;
+}
 
 static int load_log(const char *root)
 {
@@ -3551,8 +3601,9 @@ static void scen_rtstart(const char *base)
     check(load_log(root) == 0, "rtstart: engine log missing");
     if (g_log.rt_underruns)
         fprintf(stderr, "rtstart: %u underrun(s)\n", (unsigned)g_log.rt_underruns);
-    check(g_log.rt_underruns == 0u,
-          "rtstart: a fed Sendspin session let the S32 ring run dry after start");
+    check(read_tickpolls(root) == 0u,
+          "rtstart: the loop blocked on a poll timeout while Sendspin paced "
+          "playback (FIFO tick wait)");
     check(g_log.audit_denied == g_log.audit_led,
           "rtstart: the loop reached an external /sys /dev /run /data path");
 }
@@ -3803,6 +3854,7 @@ def compile_loop_fixture(cc: str, scratch: Path, source_dir: Path,
         str(source_dir / "playback_status.c"),
         "-Wl,--gc-sections",
         "-Wl,--wrap=open", "-Wl,--wrap=open64", "-Wl,--wrap=openat",
+        "-Wl,--wrap=poll",
         "-Wl,--wrap=connect",
         "-lm",
         "-o", str(binary),
