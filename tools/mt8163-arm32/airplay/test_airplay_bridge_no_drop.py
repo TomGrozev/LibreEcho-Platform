@@ -53,6 +53,13 @@ def fionread(fd):
     return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
 
 
+def backlog_settled(rig, quiet=0.2):
+    """True once the blocked engine's FIFO/pipe split stops moving."""
+    before = (fionread(rig.reader), fionread(rig.writer))
+    time.sleep(quiet)
+    return (fionread(rig.reader), fionread(rig.writer)) == before
+
+
 def wait_for(predicate, timeout=5.0, message="timed out"):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -448,12 +455,26 @@ def scenario_flush_discards_tail_keeps_session(directory):
         marker = file_identity(rig.root / "airplay.active")
         volume = file_identity(rig.root / "airplay.volume")
         # The engine is blocked: the stream backs up into the media FIFO, the
-        # bridge's remainder and airplay.pcm.
-        total = 20000  # 80 KB: fits the FIFO, remainder and airplay.pcm (~45 KB each)
-        thread = rig.feed(total, chunk=352)
-        thread.join(timeout=10)
-        assert not thread.is_alive(), "the pipes should hold 80 KB"
-        wait_for(lambda: fionread(rig.reader) >= 40000, 5)
+        # bridge's remainder and airplay.pcm. Shairport writes on until the
+        # pipes take no more, so the backlog is whatever this kernel's FIFOs
+        # give (a 64 KiB FIFO does not always fill to 64 KiB).
+        sent = 0
+        os.set_blocking(rig.writer, False)
+        try:
+            while sent < 40000:
+                try:
+                    os.write(rig.writer, frames(rig.sent_frames, 352))
+                except BlockingIOError:
+                    break
+                sent += 352
+                rig.sent_frames += 352
+        finally:
+            os.set_blocking(rig.writer, True)
+        assert sent < 40000, "a blocked engine must stop Shairport's writes"
+        total = sent
+        # Wait for the blocked state: the split between the FIFO and the pipe
+        # stops moving once the bridge can no longer write.
+        wait_for(lambda: backlog_settled(rig), 5)
         tail = fionread(rig.writer)
         assert tail > 8192, f"airplay.pcm should hold a backlog, has {tail}"  # stale tail to discard
         # Shairport flushes: the bridge discards remainder + pipe tail and answers.
