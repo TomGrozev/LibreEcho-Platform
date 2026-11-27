@@ -427,7 +427,7 @@ def validate_lidar_dtb(source: bytes | Path,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Verify a Lidar device tree.')
-    parser.add_argument('dtb', type=Path)
+    parser.add_argument('--dtb', type=Path, required=True)
     parser.add_argument('--ramdisk-addr', type=lambda value: int(value, 0))
     parser.add_argument('--ramdisk-size', type=lambda value: int(value, 0))
     args = parser.parse_args()
