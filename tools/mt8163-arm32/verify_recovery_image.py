@@ -1539,10 +1539,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 expected_wakeword_payload_size is None or
                 not wakeword.get("enabled") or
                 not wakeword.get("external_payload") or
-                wakeword.get("engine") != "openwakeword-onnx" or
+                wakeword.get("engine") != "microwakeword-tflm" or
                 wakeword.get("wake_word") != "Alexa" or
-                wakeword.get("development_model") is not True or
-                wakeword.get("model_license") != "CC-BY-NC-SA-4.0" or
+                wakeword.get("model_license") != "Apache-2.0" or
                 wakeword.get("threads") != 2 or
                 wakeword.get("sample_rate_hz") != 16000 or
                 wakeword.get("block_samples") != 1280 or
@@ -1558,14 +1557,14 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("external wakeword payload file manifest is missing")
         for required in (
             "usr/local/sbin/libreecho-waked",
-            "usr/local/share/libreecho/openwakeword/melspectrogram.onnx",
-            "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
-            "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
-            "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
-            "usr/local/share/licenses/libreecho-openwakeword/CC-BY-NC-SA-4.0.txt",
-            "usr/local/share/licenses/libreecho-openwakeword/runtime/RUNTIME-NOTICES.txt",
-            "usr/local/share/licenses/libreecho-openwakeword/runtime/ONNX-Runtime-MIT.txt",
-            "usr/local/share/licenses/libreecho-openwakeword/runtime/SpeexDSP-COPYING.txt",
+            "usr/local/share/libreecho/wakeword/alexa/alexa.tflite",
+            "usr/local/share/libreecho/wakeword/alexa/alexa.json",
+            "usr/local/share/libreecho/wakeword/vad/vad.tflite",
+            "usr/local/share/libreecho/wakeword/vad/vad.json",
+            "usr/local/share/licenses/libreecho-microwakeword/LICENSE.txt",
+            "usr/local/share/licenses/libreecho-microwakeword/NOTICE.txt",
+            "usr/local/share/licenses/libreecho-microwakeword/runtime/RUNTIME-NOTICES.txt",
+            "usr/local/share/licenses/libreecho-microwakeword/runtime/SpeexDSP-COPYING.txt",
         ):
             if required not in files:
                 fail(f"external wakeword payload member missing: {required}")

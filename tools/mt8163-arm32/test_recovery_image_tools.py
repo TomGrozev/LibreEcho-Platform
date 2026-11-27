@@ -306,74 +306,13 @@ class SourceTests(unittest.TestCase):
         self.assertIn("-Wl,--strip-all", source)
         self.assertIn("contains a host/build path", source)
 
-    def test_wakeword_runtime_uses_explicit_re2_archive(self) -> None:
-        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
-        self.assertIn(
-            "${LIBREECHO_WAKE_RE2_ARCHIVE:?ERROR:", source
+    def test_wakeword_runtime_builds_micro_wake_word(self) -> None:
+        micro = TOOLS_DIR / "wakeword/build_micro_wake_word.sh"
+        self.assertTrue(micro.is_file())
+        self.assertFalse((TOOLS_DIR / "wakeword/build_runtime.sh").exists())
+        self.assertFalse(
+            (TOOLS_DIR / "wakeword/required_operators.config").exists()
         )
-        self.assertIn('RE2_ARCHIVE="$RE2_ARCHIVE"', source)
-
-    def test_wakeword_runtime_maps_paths_for_reproducible_archives(self) -> None:
-        # ORT logging macros expand __FILE__ into compiled objects.  Without
-        # canonical path prefixes, every per-run build directory produces
-        # different bytes for identical inputs, and the fail-closed wake-ort
-        # component cache refuses to store over its own key.  Both the build
-        # directory and the source checkout must be rewritten to stable
-        # prefixes on every reduced-ORT build.
-        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
-        self.assertIn(
-            'ort_repro_flags="-ffile-prefix-map=$ORT_BUILD=ort-build '
-            '-ffile-prefix-map=$ORT_SOURCE=ort-src"',
-            source,
-        )
-        self.assertIn(
-            "-DCMAKE_C_FLAGS=\"-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard "
-            "-ffunction-sections -fdata-sections $ort_repro_flags\"",
-            source,
-        )
-        self.assertIn(
-            "-DCMAKE_CXX_FLAGS=\"-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard "
-            "-ffunction-sections -fdata-sections $ort_repro_flags\"",
-            source,
-        )
-        # The reduced-ORT build must never run without the reproducibility
-        # flags attached to the compile lines.
-        self.assertNotIn(
-            '-DCMAKE_C_FLAGS="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard '
-            '-ffunction-sections -fdata-sections"',
-            source,
-        )
-
-    def test_wakeword_speex_metadata_uses_canonical_prefix(self) -> None:
-        # The cached wake-runtime payload includes the SpeexDSP install prefix,
-        # which is a per-run directory.  The static archive and headers carry
-        # no path bytes, but libtool/pkg-config metadata does; rewrite it to a
-        # canonical prefix so identical inputs keep identical output bytes.
-        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
-        self.assertIn(
-            "prefix=/opt/libreecho/speexdsp", source
-        )
-        self.assertIn(
-            "libdir='/opt/libreecho/speexdsp/lib'", source
-        )
-        self.assertIn('$SPEEX_PREFIX/lib/pkgconfig/speexdsp.pc', source)
-        self.assertIn('$SPEEX_PREFIX/lib/libspeexdsp.la', source)
-
-    def test_wakeword_runtime_snapshots_relink_objects(self) -> None:
-        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
-        self.assertIn(
-            "${LIBREECHO_WAKE_RELINK_OUTPUT:?ERROR:", source
-        )
-        for object_name in (
-            "waked.wake.arm.o", "voice_aec.wake.arm.o",
-            "voice_reference.wake.arm.o", "voice_dsp.wake.arm.o",
-            "voice_stream.wake.arm.o", "wake_worker.wake.arm.o",
-            "wake_led.wake.arm.o", "adapter_client.wake.arm.o",
-            "adapter_server.wake.arm.o", "log.wake.arm.o",
-            "wake_engine_onnx.arm.o",
-        ):
-            self.assertIn(object_name, source)
-        self.assertIn("wakeword_relink_object_count=%s", source)
 
     def test_pinned_source_rejects_symlink_components(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -725,14 +664,25 @@ class SourceTests(unittest.TestCase):
             self.assertIn(required, tts_packager)
 
         wakeword = TOOLS_DIR / "wakeword"
-        wake_notice = (wakeword / "MODEL-LICENSE.txt").read_text()
-        self.assertIn("public payload", wake_notice)
-        self.assertIn("NonCommercial-ShareAlike", wake_notice)
-        self.assertTrue((wakeword / "CC-BY-NC-SA-4.0.txt").stat().st_size > 10000)
-        self.assertIn(
-            "CC-BY-NC-SA-4.0.txt",
-            (wakeword / "package_feature.sh").read_text(),
+        wake_notice = (wakeword / "MICROWAKEWORD-NOTICE.txt").read_text()
+        self.assertIn("Open Home Foundation", wake_notice)
+        self.assertIn("Apache License, Version 2.0", wake_notice)
+        wake_license = (wakeword / "MICROWAKEWORD-LICENSE.txt").read_text()
+        self.assertIn("Apache License", wake_license)
+        self.assertTrue(
+            (wakeword / "MICROWAKEWORD-LICENSE.txt").stat().st_size > 10000
         )
+        self.assertFalse((wakeword / "MODEL-LICENSE.txt").exists())
+        self.assertFalse((wakeword / "CC-BY-NC-SA-4.0.txt").exists())
+        wake_packager = (wakeword / "package_feature.sh").read_text()
+        for required in (
+            "MICROWAKEWORD-LICENSE.txt",
+            "MICROWAKEWORD-NOTICE.txt",
+            "usr/local/share/libreecho/wakeword",
+            "libreecho-microwakeword",
+        ):
+            self.assertIn(required, wake_packager)
+        self.assertNotIn("CC-BY-NC-SA-4.0.txt", wake_packager)
 
         airplay_builder = (TOOLS_DIR / "airplay/build_airplay.sh").read_text()
         airplay_packager = (TOOLS_DIR / "airplay/package_feature.sh").read_text()

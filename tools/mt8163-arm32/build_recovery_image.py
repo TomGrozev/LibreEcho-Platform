@@ -2029,7 +2029,7 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
 
 def add_wakeword_external_payload(payload: Path, payload_manifest: Path,
                                   manifest: dict[str, object]) -> None:
-    """Record the reduced openWakeWord runtime without bloating boot.img."""
+    """Record the microWakeWord runtime without bloating boot.img."""
     if payload.is_symlink() or not payload.is_file():
         raise SystemExit(
             f"ERROR: wakeword feature payload is not a regular file: {payload}"
@@ -2054,14 +2054,14 @@ def add_wakeword_external_payload(payload: Path, payload_manifest: Path,
         raise SystemExit("ERROR: wakeword feature manifest lacks payload/files records")
     required_files = (
         "usr/local/sbin/libreecho-waked",
-        "usr/local/share/libreecho/openwakeword/melspectrogram.onnx",
-        "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
-        "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
-        "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
-        "usr/local/share/licenses/libreecho-openwakeword/CC-BY-NC-SA-4.0.txt",
-        "usr/local/share/licenses/libreecho-openwakeword/runtime/RUNTIME-NOTICES.txt",
-        "usr/local/share/licenses/libreecho-openwakeword/runtime/ONNX-Runtime-MIT.txt",
-        "usr/local/share/licenses/libreecho-openwakeword/runtime/SpeexDSP-COPYING.txt",
+        "usr/local/share/libreecho/wakeword/alexa/alexa.tflite",
+        "usr/local/share/libreecho/wakeword/alexa/alexa.json",
+        "usr/local/share/libreecho/wakeword/vad/vad.tflite",
+        "usr/local/share/libreecho/wakeword/vad/vad.json",
+        "usr/local/share/licenses/libreecho-microwakeword/LICENSE.txt",
+        "usr/local/share/licenses/libreecho-microwakeword/NOTICE.txt",
+        "usr/local/share/licenses/libreecho-microwakeword/runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-microwakeword/runtime/SpeexDSP-COPYING.txt",
     )
     for required in required_files:
         if required not in feature_files:
@@ -2082,10 +2082,9 @@ def add_wakeword_external_payload(payload: Path, payload_manifest: Path,
         "enabled": True,
         "activation": "automatic-after-microphone",
         "autostart": True,
-        "engine": "openwakeword-onnx",
+        "engine": "microwakeword-tflm",
         "wake_word": "Alexa",
-        "development_model": True,
-        "model_license": "CC-BY-NC-SA-4.0",
+        "model_license": "Apache-2.0",
         "threads": 2,
         "sample_rate_hz": 16000,
         "block_samples": 1280,

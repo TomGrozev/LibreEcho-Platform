@@ -1,26 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WAKED="${1:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
-MEL_MODEL="${2:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
-EMBEDDING_MODEL="${3:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
-WAKE_MODEL="${4:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
-PAYLOAD="${5:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
-MANIFEST="${6:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
+USAGE="usage: package_feature.sh <waked-binary> <models-root> <payload-out> <manifest-out>"
+WAKED="${1:?$USAGE}"
+MODELS_ROOT="${2:?$USAGE}"
+PAYLOAD="${3:?$USAGE}"
+MANIFEST="${4:?$USAGE}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 COMMON_LICENSE_DIR="$(dirname "$SCRIPT_DIR")/third-party-licenses"
 PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
-LICENSE_NOTICE="$SCRIPT_DIR/MODEL-LICENSE.txt"
-LICENSE_TEXT="$SCRIPT_DIR/CC-BY-NC-SA-4.0.txt"
+MODEL_LICENSE="$SCRIPT_DIR/MICROWAKEWORD-LICENSE.txt"
+MODEL_NOTICE="$SCRIPT_DIR/MICROWAKEWORD-NOTICE.txt"
 
-for input in "$WAKED" "$MEL_MODEL" "$EMBEDDING_MODEL" "$WAKE_MODEL" \
-    "$LICENSE_NOTICE" "$LICENSE_TEXT"; do
+# microWakeWord model files are published by the pinned micro-wake-word-models
+# source. The two models the daemon always loads are hash-pinned so a stale or
+# substituted pair cannot ship silently; other staged models are installed as
+# present because the owner picks those at runtime.
+declare -A REVIEWED_MODEL_SHA256=(
+  [alexa]=9011a8155b04de858c48038529235cbc0e42e9fca05a55bf588cb80a653a723b
+  [vad]=7aa4db6d5fb7c5358609f6931e7847d303c16a43d178638bc14104f50d7eff5f
+)
+
+for input in "$WAKED" "$MODEL_LICENSE" "$MODEL_NOTICE"; do
   [[ -f "$input" && ! -L "$input" ]] || {
     echo "ERROR: wakeword input is missing or is a symlink: $input" >&2
     exit 1
   }
 done
+[[ -d "$MODELS_ROOT" && ! -L "$MODELS_ROOT" ]] || {
+  echo "ERROR: wakeword models root is missing or is a symlink: $MODELS_ROOT" >&2
+  exit 1
+}
 [[ -d "$COMMON_LICENSE_DIR" && ! -L "$COMMON_LICENSE_DIR" ]] || {
   echo "ERROR: common wakeword runtime license bundle is missing" >&2
   exit 1
@@ -30,21 +41,6 @@ done
   exit 1
 }
 
-[[ "$(sha256sum "$MEL_MODEL" | awk '{print $1}')" == \
-   ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f ]] || {
-  echo "ERROR: mel model hash is not the reviewed openWakeWord model" >&2
-  exit 1
-}
-[[ "$(sha256sum "$EMBEDDING_MODEL" | awk '{print $1}')" == \
-   70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f ]] || {
-  echo "ERROR: embedding model hash is not the reviewed openWakeWord model" >&2
-  exit 1
-}
-[[ "$(sha256sum "$WAKE_MODEL" | awk '{print $1}')" == \
-   6ff566a01d12670e8d9e3c59da32651db1575d17272a601b7f8a39283dfbae3e ]] || {
-  echo "ERROR: Alexa model hash is not the reviewed development model" >&2
-  exit 1
-}
 file -b "$WAKED" | grep -Eq 'ELF 32-bit.*ARM.*statically linked' || {
   echo "ERROR: wakeword daemon is not a static ARM32 executable" >&2
   exit 1
@@ -54,25 +50,81 @@ if readelf -l "$WAKED" | grep -q 'Requesting program interpreter'; then
   exit 1
 fi
 
-root="$(mktemp -d /tmp/libreecho-wakeword-feature.XXXXXX)"
-trap 'rm -rf "$root"' EXIT
-model_root="$root/usr/local/share/libreecho/openwakeword"
-license_root="$root/usr/local/share/licenses/libreecho-openwakeword"
-install -d "$root/usr/local/sbin" "$model_root" "$license_root"
-install -m 0755 "$WAKED" "$root/usr/local/sbin/libreecho-waked"
-install -m 0644 "$MEL_MODEL" "$model_root/melspectrogram.onnx"
-install -m 0644 "$EMBEDDING_MODEL" "$model_root/embedding_model.onnx"
-install -m 0644 "$WAKE_MODEL" "$model_root/alexa_v0.1.onnx"
-install -m 0644 "$LICENSE_NOTICE" "$license_root/MODEL-LICENSE.txt"
-install -m 0644 "$LICENSE_TEXT" "$license_root/CC-BY-NC-SA-4.0.txt"
-runtime_license_root="$license_root/runtime"
-install -d "$runtime_license_root"
-for input in "$COMMON_LICENSE_DIR"/*; do
-  [[ -f "$input" && ! -L "$input" ]] || {
-    echo "ERROR: unsafe common runtime license input: $input" >&2
+models=()
+shopt -s nullglob
+for entry in "$MODELS_ROOT"/*; do
+  [[ -L "$entry" ]] && {
+    echo "ERROR: wakeword model entry is a symlink: $entry" >&2
     exit 1
   }
-  install -m 0644 "$input" "$runtime_license_root/$(basename "$input")"
+  [[ -d "$entry" ]] || {
+    echo "ERROR: wakeword models root holds a non-directory entry: $entry" >&2
+    exit 1
+  }
+  name="$(basename -- "$entry")"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+    echo "ERROR: invalid microWakeWord model name: $name" >&2
+    exit 1
+  }
+  for extension in tflite json; do
+    [[ -f "$entry/$name.$extension" && ! -L "$entry/$name.$extension" ]] || {
+      echo "ERROR: microWakeWord model $name lacks a regular $name.$extension" >&2
+      exit 1
+    }
+  done
+  tflite_size="$(stat -c %s "$entry/$name.tflite")"
+  [[ "$tflite_size" -ge 1024 && "$tflite_size" -le 8388608 ]] || {
+    echo "ERROR: microWakeWord model $name.tflite is outside the accepted size" >&2
+    exit 1
+  }
+  # A FlatBuffer TFLite model carries the "TFL3" identifier after its root
+  # offset; a mislabelled .tflite would otherwise reach the device and fail at
+  # load time.
+  [[ "$(dd if="$entry/$name.tflite" bs=1 skip=4 count=4 2>/dev/null)" == TFL3 ]] || {
+    echo "ERROR: microWakeWord model $name.tflite is not a TFLite FlatBuffer" >&2
+    exit 1
+  }
+  if [[ -n "${REVIEWED_MODEL_SHA256[$name]:-}" ]]; then
+    [[ "$(sha256sum "$entry/$name.tflite" | awk '{print $1}')" == \
+       "${REVIEWED_MODEL_SHA256[$name]}" ]] || {
+      echo "ERROR: microWakeWord model $name.tflite is not the reviewed model" >&2
+      exit 1
+    }
+  fi
+  models+=("$name")
+done
+for required in alexa vad; do
+  [[ -d "$MODELS_ROOT/$required" ]] || {
+    echo "ERROR: required microWakeWord model is missing: $required" >&2
+    exit 1
+  }
+done
+
+root="$(mktemp -d /tmp/libreecho-wakeword-feature.XXXXXX)"
+trap 'rm -rf "$root"' EXIT
+model_root="$root/usr/local/share/libreecho/wakeword"
+license_root="$root/usr/local/share/licenses/libreecho-microwakeword"
+runtime_license_root="$license_root/runtime"
+install -d "$root/usr/local/sbin" "$model_root" "$license_root" \
+  "$runtime_license_root"
+install -m 0755 "$WAKED" "$root/usr/local/sbin/libreecho-waked"
+for name in "${models[@]}"; do
+  install -d "$model_root/$name"
+  install -m 0644 "$MODELS_ROOT/$name/$name.tflite" \
+    "$model_root/$name/$name.tflite"
+  install -m 0644 "$MODELS_ROOT/$name/$name.json" \
+    "$model_root/$name/$name.json"
+done
+install -m 0644 "$MODEL_LICENSE" "$license_root/LICENSE.txt"
+install -m 0644 "$MODEL_NOTICE" "$license_root/NOTICE.txt"
+for notice in RUNTIME-NOTICES.txt SpeexDSP-COPYING.txt; do
+  [[ -f "$COMMON_LICENSE_DIR/$notice" && \
+     ! -L "$COMMON_LICENSE_DIR/$notice" ]] || {
+    echo "ERROR: common runtime license input is missing: $notice" >&2
+    exit 1
+  }
+  install -m 0644 "$COMMON_LICENSE_DIR/$notice" \
+    "$runtime_license_root/$notice"
 done
 
 "$PACKAGER" wakeword "$root" "$PAYLOAD" "$MANIFEST"
