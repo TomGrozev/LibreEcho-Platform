@@ -698,7 +698,7 @@ create_input_nodes()
     INPUT_NODES_CREATED=$nodes
 }
 
-# Lidar puts its serial radio controller on uart2 (ttyS2 through the board's serial2 alias)
+# Lidar puts its EFR32 radio on uart2 (ttyS2 through the board's serial2 alias)
 # and controls it through a GPIO character device.  The kernel numbers both the
 # same way on every boot, but the reduced ramdisk has no devtmpfs, so userspace
 # only sees them if init materializes the nodes.  Create each node only when
@@ -2104,6 +2104,40 @@ start_shared_discovery_runtime()
     return 0
 }
 
+# The EFR32 Thread radio exists only on Lidar, and only an image that stages
+# the radio tool and otbr-agent also stages /etc/init.d/libreecho-threadd.init.
+# The entry decides from the persisted radio setting whether to touch the chip,
+# so a unit configured for zigbee or none is left alone.  The border agent
+# publishes through the shared responder, so discovery must be up first.
+start_thread_border_router()
+{
+    case "$SERVICE_PROFILE" in
+        production) ;;
+        *)
+            log thread-service-skipped-diagnostic-profile
+            return 0
+            ;;
+    esac
+    if [ ! -x /etc/init.d/libreecho-threadd.init ]; then
+        log thread-service-unavailable
+        return 0
+    fi
+    if ! /etc/init.d/libreecho-mdnsd.init status >/dev/null 2>&1 ||
+            [ ! -S "$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket" ]; then
+        log thread-service-discovery-unavailable
+        pmsg_marker thread-skipped-discovery
+        return 0
+    fi
+    if /etc/init.d/libreecho-threadd.init start >/tmp/libreecho-threadd.init.log 2>&1; then
+        log thread-service-started
+        pmsg_marker thread-started
+    else
+        log thread-service-degraded
+        pmsg_marker thread-start-failed
+    fi
+    return 0
+}
+
 # Which slot is running. The bootloader on this family writes the suffix empty
 # (`androidboot.slot_suffix=_`), so the kernel command line frequently does not
 # say -- measured on the biscuit Dot, whose cmdline carries the key with no
@@ -2524,6 +2558,7 @@ start_ui_services()
     # services="logd networkd timed audiod micd ledd buttond btd esphomed web"
     stop_ui_voice_owners || log ui-conflicting-owner-continuing
     start_shared_discovery_runtime
+    start_thread_border_router
     log feature-services-deferred-until-staged
     for service in $services; do
         # On a recovery boot the boot-path Wi-Fi worker may still be creating

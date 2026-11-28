@@ -9,16 +9,12 @@
  *
  * RESET_N has no pull-up: closing the GPIO handle returns the line to input
  * and holds the chip in reset, so `run` must stay alive for as long as the
- * application should keep running (lab-notes/phase-06/hw-20261121/step25-efr32/
- * result.md in https://github.com/TomGrozev/libreecho-lidar-port).  `version`
- * therefore touches the UART only, so it works while that holder owns the
- * lines.
+ * application should keep running.  `version` therefore touches the UART only,
+ * so it works while that holder owns the lines.
  *
  * The radio shares uart2 with the EFR32's Gecko bootloader.  It runs without
- * hardware flow control; the lab proved both the bootloader menu and the
- * OpenThread RCP on this port with crtscts off
- * (lab-notes/phase-06/hw-20261121/step25-efr32/result.md in
- * https://github.com/TomGrozev/libreecho-lidar-port).
+ * hardware flow control; both the bootloader menu and the OpenThread RCP on
+ * this port work with crtscts off.
  */
 #define _GNU_SOURCE
 #include <errno.h>

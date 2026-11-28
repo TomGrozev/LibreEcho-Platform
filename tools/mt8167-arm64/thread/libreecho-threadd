@@ -119,8 +119,7 @@ stop_pidfile() {  # stop_pidfile <pidfile>
 }
 
 # RESET_N has no pull-up on this board: a released line parks the EFR32 in
-# reset (lab-notes/phase-06/hw-20261121/step25-efr32/result.md in the
-# libreecho-lidar-port archive).  `lidar-efr32 run` therefore stays alive and
+# reset.  `lidar-efr32 run` therefore stays alive and
 # keeps the line driven high; this pidfile is that holder.
 start_holder() {
     pidfile=$(helper_pidfile radio)
