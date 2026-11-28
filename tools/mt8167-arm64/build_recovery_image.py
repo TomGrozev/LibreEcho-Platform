@@ -737,6 +737,41 @@ def validate_ui_and_mdns_inputs(args: argparse.Namespace) -> bool:
     return ui_enabled
 
 
+def validate_ssh_inputs(args: argparse.Namespace) -> bool:
+    """Apply the shared opt-in SSH bundle rules; return whether SSH is staged."""
+    ssh_options = {
+        'dropbear': args.dropbear,
+        'dropbearkey': args.dropbearkey,
+        'scp': args.scp,
+    }
+    ssh_enabled = args.ssh_enabled
+    if ssh_enabled and not all(value is not None for value in ssh_options.values()):
+        missing = ', '.join(
+            '--' + name.replace('_', '-')
+            for name, value in ssh_options.items() if value is None
+        )
+        raise BuildError(f'SSH bundle is explicitly enabled but missing {missing}')
+    if not ssh_enabled and any(value is not None for value in ssh_options.values()):
+        raise BuildError('SSH inputs require the explicit --ssh-enabled opt-in')
+    return ssh_enabled
+
+
+def disabled_ssh_record() -> dict[str, object]:
+    """The manifest record for an image built without the SSH opt-in."""
+    return {
+        'enabled': False,
+        'activation': 'saved-ssh-setting-and-webui-users',
+        'autostart': False,
+        'authentication': 'webui-users-sha256',
+        'account_source': '/data/libreecho/config/users',
+        'privilege_policy': 'non-root-ephemeral-users',
+        'public_key_auth': False,
+        'root_login': False,
+        'host_keys': 'persistent-/data/libreecho/config/ssh-host-ed25519-key',
+        'files': {},
+    }
+
+
 def reject_mt8163_payload(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     refused = {
         'audio_probe': '--audio-probe (no Lidar audio profile exists yet)',
@@ -809,6 +844,14 @@ def main() -> None:
                         help='staged static ARM32 tinycap')
     parser.add_argument('--tinymix', type=Path,
                         help='staged static ARM32 tinymix')
+    parser.add_argument('--ssh-enabled', action='store_true',
+                        help='explicitly enable deferred WebUI-account SSH')
+    parser.add_argument('--dropbear', type=Path,
+                        help='static ARM32 Dropbear server with WebUI auth')
+    parser.add_argument('--dropbearkey', type=Path,
+                        help='static ARM32 Dropbear host-key utility')
+    parser.add_argument('--scp', type=Path,
+                        help='static ARM32 scp server-side transfer executable')
     parser.add_argument('--audio-probe', type=Path,
                         help='MT8163-only optional payload; refused for lidar')
     parser.add_argument('--wifi-dtb', type=Path,
@@ -823,6 +866,7 @@ def main() -> None:
     targets.validate_target_arguments(parser, args)
     reject_mt8163_payload(parser, args)
     ui_enabled = validate_ui_and_mdns_inputs(args)
+    ssh_enabled = validate_ssh_inputs(args)
 
     output = args.output.resolve()
     ramdisk_output = (args.ramdisk_output or output.with_suffix('.ramdisk.cpio.xz')).resolve()
@@ -867,6 +911,7 @@ def main() -> None:
                     'size': len(dtb)},
         },
         'audio': {'enabled': False, 'reason': 'no Lidar audio profile staged'},
+        'ssh': disabled_ssh_record(),
         'ui': {
             'enabled': False,
             'activation': 'manual-only',
@@ -924,6 +969,11 @@ def main() -> None:
             )
         if args.mdns_runtime is not None:
             shared.add_mdns_runtime(stage, args.mdns_runtime.resolve(), manifest)
+        if ssh_enabled:
+            shared.add_ssh_bundle(
+                stage, args.dropbear.resolve(), args.dropbearkey.resolve(),
+                args.scp.resolve(), manifest,
+            )
         shared.validate_stage(stage)
         cpio = shared.build_cpio(stage, 0)
     ramdisk = compress_ramdisk(cpio)

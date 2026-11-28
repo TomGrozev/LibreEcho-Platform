@@ -487,6 +487,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, Any], target: str,
             entries, manifest, expected.get('mdns_manifest'),
             expected['service_profile'],
         )
+        shared.validate_ssh(
+            entries, manifest, expected.get('dropbear'),
+            expected.get('dropbearkey'), expected.get('scp'),
+        )
     except SystemExit as exc:
         raise VerifyError(str(exc)) from exc
 
@@ -691,6 +695,12 @@ def main() -> None:
     parser.add_argument('--expected-bootctl-sha256', required=True)
     parser.add_argument('--expected-update-verifier-sha256', required=True)
     parser.add_argument('--expected-ota-public-key-sha256', required=True)
+    parser.add_argument('--expected-dropbear-sha256',
+                        help='require this static ARM32 Dropbear server in the initramfs')
+    parser.add_argument('--expected-dropbearkey-sha256',
+                        help='require this static ARM32 Dropbear host-key utility in the initramfs')
+    parser.add_argument('--expected-scp-sha256',
+                        help='require the static ARM32 scp server-side executable in the initramfs')
     parser.add_argument('--expected-ui-manifest-sha256',
                         help='require this pinned LibreEcho-UI file manifest')
     parser.add_argument('--expected-ui-commit',
@@ -727,6 +737,9 @@ def main() -> None:
         'bootctl': args.expected_bootctl_sha256,
         'update_verifier': args.expected_update_verifier_sha256,
         'ota_key': args.expected_ota_public_key_sha256,
+        'dropbear': args.expected_dropbear_sha256,
+        'dropbearkey': args.expected_dropbearkey_sha256,
+        'scp': args.expected_scp_sha256,
         'ui_manifest': args.expected_ui_manifest_sha256,
         'ui_commit': args.expected_ui_commit,
         'ui_diff_sha256': args.expected_ui_diff_sha256,

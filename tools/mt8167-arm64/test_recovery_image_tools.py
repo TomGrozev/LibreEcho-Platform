@@ -352,6 +352,44 @@ def mdns_fixture(directory: Path) -> tuple[Path, dict[str, str]]:
     }
 
 
+def ssh_fixture(directory: Path) -> tuple[Path, Path, Path]:
+    binaries = directory / 'ssh-binaries'
+    binaries.mkdir(exist_ok=True)
+    paths = []
+    for name in ('dropbear', 'dropbearkey', 'scp'):
+        path = binaries / name
+        path.write_bytes(make_elf32_arm())
+        path.chmod(0o755)
+        paths.append(path)
+    return paths[0], paths[1], paths[2]
+
+
+def ssh_staged(directory: Path) -> tuple[Path, dict[str, object]]:
+    stage = directory / 'ssh-stage'
+    stage.mkdir(exist_ok=True)
+    dropbear, dropbearkey, scp = ssh_fixture(directory)
+    manifest: dict[str, object] = {}
+    with mock.patch.object(
+            builder.shared, 'require_elf_contract',
+            return_value={'class': 1, 'machine': 40, 'flags': '0x05000400',
+                          'interpreter': None, 'needed': [], 'dynamic': False}):
+        builder.shared.add_ssh_bundle(stage, dropbear, dropbearkey, scp, manifest)
+    return stage, manifest
+
+
+def stage_entries(stage: Path) -> dict[str, object]:
+    staged: list[tuple[str, int, bytes]] = []
+    for path in sorted(stage.rglob('*')):
+        relative = path.relative_to(stage).as_posix()
+        if path.is_dir():
+            staged.append((relative, stat.S_IFDIR | 0o755, b''))
+        else:
+            staged.append((relative, stat.S_IFREG |
+                           stat.S_IMODE(path.stat().st_mode),
+                           path.read_bytes()))
+    return verifier.shared.parse_newc(make_cpio(staged))
+
+
 def build_manifest(record: dict[str, object], ramdisk: bytes,
                    symlinks: dict[str, str], overlay: dict[str, dict[str, object]],
                    applets: list[str], elf_sha: str,
@@ -368,6 +406,7 @@ def build_manifest(record: dict[str, object], ramdisk: bytes,
                           'size': len(profile)},
         'audio': {'enabled': True, 'path': '/etc/libreecho/audio-profile',
                   'sha256': builder.sha256(profile), 'size': len(profile)},
+        'ssh': builder.disabled_ssh_record(),
         'wifi_firmware': {
             'patch': {'sha256': builder.WIFI_PATCH_SHA256,
                       'size': builder.WIFI_PATCH_SIZE,
@@ -639,6 +678,54 @@ class LidarImageTests(unittest.TestCase):
         with self.assertRaises(verifier.VerifyError) as caught:
             self.verify(boot, manifest, ramdisk=ramdisk, expected_extra=expected)
         self.assertIn('hash mismatch', str(caught.exception))
+
+    def test_ssh_bundle_is_opt_in_and_verified(self):
+        stage, manifest = ssh_staged(self.directory)
+        for name in ('sbin/dropbear', 'sbin/dropbearkey', 'usr/bin/scp',
+                     'etc/init.d/libreecho-ssh.init', 'etc/passwd'):
+            self.assertTrue((stage / name).is_file(), name)
+        self.assertTrue(manifest['ssh']['enabled'])
+        entries = stage_entries(stage)
+        self.assertTrue(verifier.shared.validate_ssh(
+            entries, manifest, self.elf_sha, self.elf_sha, self.elf_sha))
+
+    def test_ssh_bundle_disabled_by_default(self):
+        manifest = {'ssh': builder.disabled_ssh_record()}
+        self.assertFalse(manifest['ssh']['enabled'])
+        self.assertEqual(manifest['ssh']['files'], {})
+        entries = verifier.shared.parse_newc(make_cpio([]))
+        self.assertFalse(verifier.shared.validate_ssh(
+            entries, manifest, None, None, None))
+
+    def test_verifier_rejects_a_bad_ssh_pin(self):
+        stage, manifest = ssh_staged(self.directory)
+        entries = stage_entries(stage)
+        with self.assertRaises(SystemExit) as caught:
+            verifier.shared.validate_ssh(
+                entries, manifest, '0' * 64, self.elf_sha, self.elf_sha)
+        self.assertIn('hash mismatch', str(caught.exception))
+
+    def test_verifier_rejects_an_ssh_pin_without_a_bundle(self):
+        manifest = {'ssh': builder.disabled_ssh_record()}
+        entries = verifier.shared.parse_newc(make_cpio([]))
+        with self.assertRaises(SystemExit) as caught:
+            verifier.shared.validate_ssh(entries, manifest, self.elf_sha,
+                                         self.elf_sha, self.elf_sha)
+        self.assertIn('expectation mismatch', str(caught.exception))
+
+    def test_ssh_inputs_require_the_explicit_opt_in(self):
+        args = mock.Mock(ssh_enabled=False, dropbear=Path('dropbear'),
+                         dropbearkey=None, scp=None)
+        with self.assertRaises(builder.BuildError) as caught:
+            builder.validate_ssh_inputs(args)
+        self.assertIn('--ssh-enabled', str(caught.exception))
+        args = mock.Mock(ssh_enabled=True, dropbear=Path('dropbear'),
+                         dropbearkey=Path('dropbearkey'), scp=None)
+        with self.assertRaises(builder.BuildError) as caught:
+            builder.validate_ssh_inputs(args)
+        self.assertIn('--scp', str(caught.exception))
+        args.scp = Path('scp')
+        self.assertTrue(builder.validate_ssh_inputs(args))
 
     def test_target_table_renders_the_lidar_audio_profile(self):
         record = targets.get_target('lidar')
