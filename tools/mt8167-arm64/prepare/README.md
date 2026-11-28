@@ -111,7 +111,7 @@ that keeps the files out of git.
 
 The product release gate (`LibreEcho` `tools/prepare-release.py`,
 `reject_donor_derived_artifacts`) refuses an asset with an MTK preloader/LK/TEE
-or eMMC boot header, a Gecko GBL header, an EFR32 radio name, or a digest from
+or eMMC boot header, a Gecko GBL header, a radio firmware name, or a digest from
 `donor-artifacts.json`.
 
 ## Chain layout

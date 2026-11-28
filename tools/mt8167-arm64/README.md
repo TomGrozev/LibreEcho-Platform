@@ -152,23 +152,6 @@ UI and discovery inputs follow the shared MT8163 contract:
 - `--mdns-runtime PATH` stages the boot-contained shared Avahi/D-Bus runtime.
   `--service-profile production` requires it.
 
-The Thread border router is Lidar-only, because only Lidar has the EFR32 radio:
-
-- `--lidar-efr32 PATH` and `--otbr-agent PATH` stage the radio tool, the
-  border agent and `/etc/init.d/libreecho-threadd.init` together; one without
-  the other is refused, and both are refused outside `--target lidar`.
-- The service takes the radio only when the persisted `radio` setting is
-  `thread`. `lidar-efr32 run` holds `RESET_N` high for the lifetime of the
-  border agent, because the line has no pull-up.
-- otbr-agent publishes through the one Avahi/D-Bus responder that
-  `/etc/init.d/libreecho-mdnsd.init` supervises. No private `dbus-daemon`,
-  `avahi-daemon` or daemon config is staged: a second responder would race
-  the shared one. `libreecho-init` starts the service only after that
-  responder is up, and only when the init entry is present.
-- `manifest['thread']` records the payload. The verifier requires the three
-  staged members when the record is enabled and rejects a thread init on an
-  image whose manifest disables it.
-
 An `--image-profile ota` image must also pass `--ui-bundle`: its OTA health
 probe runs `/usr/local/sbin/libreecho-web` and
 `/etc/init.d/libreecho-web.init`, and only the UI bundle stages them.  The

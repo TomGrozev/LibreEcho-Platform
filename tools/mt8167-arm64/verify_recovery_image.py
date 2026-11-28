@@ -310,61 +310,6 @@ def _mode(record: object) -> int:
         raise VerifyError('manifest overlay mode is not octal') from exc
 
 
-THREAD_INIT = 'etc/init.d/libreecho-threadd.init'
-THREAD_FILES = ('lidar-efr32', 'otbr-agent')
-THREAD_PRIVATE_OWNERS = (
-    'usr/local/sbin/dbus-daemon',
-    'usr/local/sbin/avahi-daemon',
-    'etc/dbus-1/system.conf',
-    'etc/avahi/avahi-daemon.conf',
-)
-
-
-def validate_thread(entries: dict[str, Any], manifest: dict[str, Any]) -> None:
-    """The Thread border router ships only with the EFR32 radio, and only once.
-
-    otbr-agent must publish through the single platform Avahi/D-Bus responder,
-    so a second daemon or daemon config in the same image is a contract
-    violation, not an alternative layout.
-    """
-    raw_thread = manifest.get('thread', {'enabled': False})
-    if (not isinstance(raw_thread, dict)
-            or not isinstance(raw_thread.get('enabled'), bool)):
-        fail('manifest has a malformed thread record')
-    thread = cast(dict[str, Any], raw_thread)
-    if not thread.get('enabled'):
-        if THREAD_INIT in entries:
-            fail('the Thread init entry is staged but the manifest disables it')
-        return
-    if thread.get('activation') != 'thread-radio-only':
-        fail('thread runtime activation differs from the contract')
-    if thread.get('discovery') != 'shared-avahi-dbus':
-        fail('thread runtime must use the shared Avahi/D-Bus responder')
-    if thread.get('start_order') != list(THREAD_FILES):
-        fail('thread runtime start order differs from the contract')
-    files = thread.get('files')
-    if not isinstance(files, dict):
-        fail('manifest lacks the thread runtime records')
-    init = files.get('libreecho-threadd')
-    if not isinstance(init, dict):
-        fail('manifest lacks the thread init record')
-    shared.require_member(entries, THREAD_INIT, str(init.get('sha256')), 0o755)
-    for name in THREAD_FILES:
-        record = files.get(name)
-        if not isinstance(record, dict):
-            fail(f'manifest lacks the thread record for {name}')
-        digest = str(record.get('sha256'))
-        entry = shared.require_member(entries, f'usr/local/sbin/{name}',
-                                      digest, 0o755)
-        if record.get('size') != len(entry.data):
-            fail(f'{name} size differs from the manifest')
-        if shared.elf_info(entry.data) != (1, 40, 0x05000400, None, (), False):
-            fail(f'{name} is not a static ARM32 hard-float executable')
-    for relative in THREAD_PRIVATE_OWNERS:
-        if relative in entries:
-            fail(f'Thread runtime stages a private mDNS owner: {relative}')
-
-
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, Any], target: str,
                        digest: str | None, expected: dict[str, Any]) -> None:
     initramfs = manifest.get('initramfs')
@@ -517,8 +462,6 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, Any], target: str,
     elif any(expected.get(name) is not None
              for name in ('tinyplay', 'tinycap', 'tinymix')):
         fail('an audio tool pin was given but the image stages none')
-
-    validate_thread(entries, manifest)
 
     for relative, text in (
         ('etc/libreecho/image-profile', expected['image_profile'] + '\n'),

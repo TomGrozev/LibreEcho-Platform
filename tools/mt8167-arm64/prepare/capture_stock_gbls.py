@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Capture the stock EFR32 Zigbee GBLs from a host-side dump into local-firmware/.
+"""Capture the stock Zigbee GBLs from a host-side dump into local-firmware/.
 
 The Echo Plus 2nd Gen ships two Amazon-signed GBL images in its stock system
 partition:
 
     system/vendor/firmware/silabs/xncp-fw.gbl       Zigbee NCP
-    system/vendor/firmware/dsr/zb_mux_rcp.gbl       Zigbee/Thread mux RCP
+    system/vendor/firmware/dsr/zb_mux_rcp.gbl       Zigbee mux RCP
 
 They stay local copies.  This script reads only a directory on the host (a
 mounted dump or an extracted rootfs), never adb, fastboot, a serial port or a

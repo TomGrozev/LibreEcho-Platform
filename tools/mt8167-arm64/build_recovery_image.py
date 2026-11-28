@@ -888,7 +888,6 @@ def main() -> None:
             'runtime_dirs': {},
             'files': {},
         },
-        'thread': {'enabled': False},
     }
     overlay = SIBLING / 'initramfs'
     with tempfile.TemporaryDirectory(prefix='libreecho-lidar-initramfs-') as temporary:
